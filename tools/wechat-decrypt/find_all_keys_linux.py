@@ -8,6 +8,7 @@ WCDB 缓存的 x'<64hex_enc_key><32hex_salt>' 模式，
 读取方式: /proc/<pid>/maps + /proc/<pid>/mem
 权限要求: root 或 CAP_SYS_PTRACE
 """
+import argparse
 import functools
 import os
 import re
@@ -143,11 +144,23 @@ def _check_permissions():
     sys.exit(1)
 
 
-def main():
-    from config import load_config
-    _cfg = load_config()
-    db_dir = _cfg["db_dir"]
-    out_file = _cfg["keys_file"]
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="提取 Linux 微信数据库密钥（内存扫描）")
+    parser.add_argument("--db-dir", help="该账号的 db_storage 目录；省略时使用现有 config.py")
+    parser.add_argument("--out-file", help="该账号的密钥 JSON 输出文件；省略时使用现有 config.py")
+    parser.add_argument("--pid", type=int, action="append", default=[], help="仅扫描已登记的微信 PID；可重复指定")
+    args = parser.parse_args(argv)
+    if bool(args.db_dir) != bool(args.out_file):
+        parser.error("--db-dir 和 --out-file 必须同时指定")
+    if args.db_dir:
+        db_dir = args.db_dir
+        out_file = args.out_file
+    else:
+        from config import load_config
+
+        _cfg = load_config()
+        db_dir = _cfg["db_dir"]
+        out_file = _cfg["keys_file"]
 
     _check_permissions()
 
@@ -166,6 +179,12 @@ def main():
 
     # 2. 找到微信进程
     pids = get_pids()
+    if args.pid:
+        requested = set(args.pid)
+        pids = [item for item in pids if item[0] in requested]
+        missing = requested - {pid for pid, _ in pids}
+        if missing:
+            raise RuntimeError(f"已登记 PID 不是可扫描的微信进程: {', '.join(str(pid) for pid in sorted(missing))}")
 
     hex_re = re.compile(rb"x'([0-9a-fA-F]{64,192})'")
     key_map = {}  # salt_hex -> enc_key_hex

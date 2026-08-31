@@ -19,7 +19,10 @@ import sys
 import time
 
 
-DISPLAY = ":1"
+# Runtime/Core supplies this per account.  The legacy display remains the
+# default so existing single-account Console usage is unchanged.
+DISPLAY = os.environ.get("WECHAT_DISPLAY", ":1")
+PREFERRED_WINDOW_ID = os.environ.get("WECHAT_WINDOW_ID", "").strip()
 
 
 def run(args: list[str], input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
@@ -94,6 +97,19 @@ def close_non_main_wechat_windows() -> None:
 
 
 def find_main_window() -> dict:
+    if PREFERRED_WINDOW_ID:
+        try:
+            geom = window_geometry(PREFERRED_WINDOW_ID)
+            width = int(geom.get("width") or 0)
+            height = int(geom.get("height") or 0)
+            props = xprop(PREFERRED_WINDOW_ID)
+        except Exception as exc:
+            raise RuntimeError(f"指定的微信窗口不可用: {PREFERRED_WINDOW_ID}") from exc
+        if width < 240 or height < 320 or "wechat" not in props.lower():
+            raise RuntimeError(f"指定窗口不是可控制的微信主聊天窗口: {PREFERRED_WINDOW_ID}")
+        geom["name"] = window_name(PREFERRED_WINDOW_ID)
+        geom["area"] = width * height
+        return geom
     close_non_main_wechat_windows()
     result = run(["xdotool", "search", "--onlyvisible", "--class", "wechat"], check=False)
     candidates: list[dict] = []

@@ -1,0 +1,16 @@
+{
+  "accounts": [
+    {
+      "account_id": "lab-alpha",
+      "display_name": "实验室微信 Alpha",
+      "source_db_dir": "config/xwechat_files/ACCOUNT_ALPHA/db_storage",
+      "wechat_base_dir": "config/xwechat_files/ACCOUNT_ALPHA",
+      "runtime_dir": "runtime/accounts/lab-alpha",
+      "runtime": {
+        "display": ":1",
+        "window_id": "",
+        "sender_enabled": false
+      }
+    }
+  ]
+}

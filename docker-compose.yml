@@ -1,6 +1,8 @@
 services:
   wechat-selkies:
-    image: ${WECHAT_SELKIES_IMAGE:-ghcr.io/nickrunning/wechat-selkies:0.0.12-minimal}
+    build:
+      context: ../runtime
+    image: ${WECHAT_RUNTIME_IMAGE:-wechat-runtime:local}
     platform: ${WECHAT_SELKIES_PLATFORM:-}
     container_name: wechat-selkies
     restart: unless-stopped
@@ -17,6 +19,8 @@ services:
       - ./tools/wechat-decrypt:/opt/wechat-decrypt:ro
       - ./agent_console:/opt/wechat-controller:ro
       - ./runtime/wechat-decrypt:/runtime/wechat-decrypt
+      - wechat-runtime-state:/run/wechat-runtime
+      - wechat-x11:/tmp/.X11-unix
     environment:
       - PUID=${PUID:-1000}
       - PGID=${PGID:-100}
@@ -26,10 +30,18 @@ services:
       - AUTO_START_QQ=${AUTO_START_QQ:-false}
       - CUSTOM_USER=${CUSTOM_USER:-}
       - PASSWORD=${PASSWORD}
+      - WECHAT_ACCOUNTS=${WECHAT_ACCOUNTS:-account-a,account-b}
+      - WECHAT_DEFAULT_ACCOUNT_ID=${WECHAT_DEFAULT_ACCOUNT_ID:-account-a}
+      - WECHAT_ACCOUNT_UID_BASE=${WECHAT_ACCOUNT_UID_BASE:-20000}
+      - WECHAT_ACCOUNTS_FILE=/config/wechat-runtime/accounts.json
+      - WECHAT_ACCOUNT_HOME_ROOT=/config/wechat-accounts
+      - WECHAT_ACCOUNT_DISPLAY_MAP=${WECHAT_ACCOUNT_DISPLAY_MAP:-}
+      - WECHAT_LEGACY_DEFAULT_ACCOUNT=${WECHAT_LEGACY_DEFAULT_ACCOUNT:-false}
 
   wechat-memory-sync:
     image: ${WECHAT_AGENT_IMAGE:-docker.io/xiaoguiwucan/linux-wechat-agent:latest}
     container_name: wechat-memory-sync
+    profiles: ["legacy"]
     restart: unless-stopped
     depends_on:
       - wechat-selkies
@@ -65,6 +77,7 @@ services:
   wechat-ai-memory:
     image: ${WECHAT_AGENT_IMAGE:-docker.io/xiaoguiwucan/linux-wechat-agent:latest}
     container_name: wechat-ai-memory
+    profiles: ["legacy"]
     restart: unless-stopped
     depends_on:
       - wechat-memory-sync
@@ -94,6 +107,7 @@ services:
   wechat-agent-console:
     image: ${WECHAT_AGENT_IMAGE:-docker.io/xiaoguiwucan/linux-wechat-agent:latest}
     container_name: wechat-agent-console
+    profiles: ["legacy"]
     restart: unless-stopped
     depends_on:
       - wechat-ai-memory
@@ -113,3 +127,45 @@ services:
       - 0.0.0.0
       - --port
       - "8078"
+
+  wechat-core:
+    build:
+      context: .
+    image: ${WECHAT_AGENT_IMAGE:-docker.io/xiaoguiwucan/linux-wechat-agent:latest}
+    container_name: wechat-core
+    restart: unless-stopped
+    depends_on:
+      - wechat-selkies
+    pid: "service:wechat-selkies"
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    ports:
+      - "${CORE_BIND:-127.0.0.1}:${CORE_PORT:-8080}:8080"
+    volumes:
+      - ./config:/app/config:ro
+      - ./runtime:/app/runtime
+      - wechat-runtime-state:/run/wechat-runtime
+      - wechat-x11:/tmp/.X11-unix
+    command:
+      - python
+      - -m
+      - core.app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --registry
+      - /app/config/wechat-runtime/accounts.json
+      - --require-registry
+      - --database
+      - /app/runtime/core/wechat_core.sqlite
+      - --sync-interval
+      - "${CORE_SYNC_INTERVAL:-5}"
+      - --send-interval
+      - "${CORE_SEND_INTERVAL:-1}"
+
+volumes:
+  wechat-runtime-state:
+  wechat-x11:

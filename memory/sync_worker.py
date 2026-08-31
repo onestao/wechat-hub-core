@@ -12,9 +12,18 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from decrypt_sync import refresh_decrypted
-from media_sync import sync_media
-from memory_ingest import ingest_memory
+if __package__:
+    # Package imports keep the module reusable from Core.  The script branch
+    # below preserves the historical `python memory/sync_worker.py` entrypoint.
+    from .decrypt_sync import refresh_decrypted
+    from .media_sync import sync_media
+    from .memory_ingest import ingest_memory
+    from .sync_repair import repair_memory_indexes
+else:
+    from decrypt_sync import refresh_decrypted
+    from media_sync import sync_media
+    from memory_ingest import ingest_memory
+    from sync_repair import repair_memory_indexes
 
 
 STOP = False
@@ -35,15 +44,6 @@ def write_json(path: Path, payload: dict) -> None:
 def handle_stop(signum, frame) -> None:  # noqa: ARG001
     global STOP
     STOP = True
-
-
-def repair_memory_indexes(memory_db: Path) -> dict:
-    started = time.time()
-    with sqlite3.connect(memory_db, timeout=30) as conn:
-        conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute("REINDEX")
-        check = conn.execute("PRAGMA integrity_check").fetchone()[0]
-    return {"ok": check == "ok", "integrity_check": check, "elapsed_seconds": round(time.time() - started, 3)}
 
 
 def run_once(args) -> dict:
