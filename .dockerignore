@@ -3,6 +3,8 @@
 .env
 config
 runtime
-tools
+tools/wechat-decrypt/all_keys*.json
+tools/wechat-decrypt/wxwork_keys*.json
+tools/wechat-decrypt/config.json
 __pycache__
 *.pyc
