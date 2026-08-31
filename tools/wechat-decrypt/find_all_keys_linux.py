@@ -184,7 +184,17 @@ def main(argv=None):
         pids = [item for item in pids if item[0] in requested]
         missing = requested - {pid for pid, _ in pids}
         if missing:
-            raise RuntimeError(f"已登记 PID 不是可扫描的微信进程: {', '.join(str(pid) for pid in sorted(missing))}")
+            # Runtime bridges can include UID-matching supervisor helpers. They
+            # are useful as provenance metadata, not as required scan targets.
+            print(
+                "[WARN] 忽略不可扫描的已登记 PID: "
+                + ", ".join(str(pid) for pid in sorted(missing))
+            )
+        if not pids:
+            raise RuntimeError(
+                "已登记 PID 中没有可扫描的微信进程: "
+                + ", ".join(str(pid) for pid in sorted(requested))
+            )
 
     hex_re = re.compile(rb"x'([0-9a-fA-F]{64,192})'")
     key_map = {}  # salt_hex -> enc_key_hex

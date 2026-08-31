@@ -37,6 +37,7 @@ def media_args(account: AccountConfig) -> SimpleNamespace:
         media_dir=account.media_dir,
         config_file=account.config_file,
         prefer_thumbnails=False,
+        download_stickers=False,
     )
 
 
@@ -50,13 +51,6 @@ class AccountWorker:
     def run_account(self, account: AccountConfig, *, force_refresh: bool = False) -> dict[str, Any]:
         account = resolve_runtime_account(account)
         started = time.monotonic()
-        self.store.upsert_account(
-            account.account_id,
-            account.display_name,
-            state="starting",
-            runtime=account.public_runtime(),
-            sync={"healthy": False, "started_at": now_iso()},
-        )
         status: dict[str, Any] = {
             "account_id": account.account_id,
             "ok": False,

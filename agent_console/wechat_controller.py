@@ -23,6 +23,8 @@ import time
 # default so existing single-account Console usage is unchanged.
 DISPLAY = os.environ.get("WECHAT_DISPLAY", ":1")
 PREFERRED_WINDOW_ID = os.environ.get("WECHAT_WINDOW_ID", "").strip()
+MIN_CHAT_WINDOW_WIDTH = 600
+MIN_CHAT_WINDOW_HEIGHT = 500
 
 
 def run(args: list[str], input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
@@ -129,6 +131,20 @@ def find_main_window() -> dict:
     if not candidates:
         raise RuntimeError("未找到可控制的微信主聊天窗口")
     return max(candidates, key=lambda item: int(item.get("area") or 0))
+
+
+def chat_window_ready(window: dict) -> bool:
+    return (
+        int(window.get("width") or 0) >= MIN_CHAT_WINDOW_WIDTH
+        and int(window.get("height") or 0) >= MIN_CHAT_WINDOW_HEIGHT
+    )
+
+
+def require_chat_window(window: dict) -> None:
+    if not chat_window_ready(window):
+        raise RuntimeError(
+            "微信窗口当前是登录/非聊天界面；请先完成登录并恢复主聊天窗口，发送已拒绝"
+        )
 
 
 def sleep_seconds(seconds: float) -> None:
@@ -322,6 +338,7 @@ def open_chat(chat_name: str, switch_delay: float) -> dict:
         raise RuntimeError("缺少目标群名")
     search_query = chat_search_query(chat_name)
     window = find_main_window()
+    require_chat_window(window)
     activate(window)
     width = int(window["width"])
     height = int(window["height"])
@@ -355,6 +372,7 @@ def paste_active(text: str, send: bool, send_delay: float) -> dict:
     if not text.strip():
         raise RuntimeError("回复内容为空")
     window = find_main_window()
+    require_chat_window(window)
     activate(window)
     width = int(window["width"])
     height = int(window["height"])
@@ -396,6 +414,7 @@ def paste_mention_active(text: str, mention_alias: str, mention_display: str, se
     if not alias:
         raise RuntimeError("缺少可用于蓝色@的 alias")
     window = find_main_window()
+    require_chat_window(window)
     activate(window)
     width = int(window["width"])
     height = int(window["height"])
@@ -480,6 +499,7 @@ def paste_image_active(path: str, send: bool, send_delay: float) -> dict:
     if not os.path.exists(path):
         raise RuntimeError(f"图片文件不存在: {path}")
     window = find_main_window()
+    require_chat_window(window)
     activate(window)
     width = int(window["width"])
     height = int(window["height"])
@@ -503,6 +523,7 @@ def paste_image_active(path: str, send: bool, send_delay: float) -> dict:
 
 def submit_active(send_delay: float) -> dict:
     window = find_main_window()
+    require_chat_window(window)
     activate(window)
     sleep_seconds(max(send_delay, 0))
     key("Return")
@@ -517,7 +538,8 @@ def focus_active() -> dict:
 
 def window_status() -> dict:
     window = find_main_window()
-    return {"window": window, "available": True}
+    ready = chat_window_ready(window)
+    return {"window": window, "available": True, "chat_ready": ready, "login_required": not ready}
 
 
 def clear_active() -> dict:

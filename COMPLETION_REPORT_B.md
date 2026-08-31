@@ -1,16 +1,16 @@
 # Completion Report B - Multi-account WeChat Core
 
-Date: 2026-08-31 (Asia/Shanghai)
+Date: 2026-09-01 (Asia/Shanghai)
 
 Branch: `feat/multi-account-core`
 
-Gate result: **source-based multi-account Core implementation is complete for
-host-testable work. Package A has separately passed real two-account Gate 0 on
-Unraid, but Gate 1 real-WeChat proof for this B build remains pending. The
-current Windows execution host has no Docker, and this tool session's attempted
-`ssh unraid` connection returned exit 255, so the revised B image has not yet
-been deployed against A's live processes/databases. No fixture/Mock result below
-is claimed as a real WeChat result.**
+Gate result: **the source-based multi-account Core implementation is deployed on
+Unraid and its real two-account read path is proven. Account-scoped key
+extraction, decryption, chat/contact/member normalization, API events and media
+streaming all ran against Package A's live Runtime. The two WeChat clients are
+currently logged out, so the guarded post-fix text/image send and database echo
+proof remains pending. Gate 1 is therefore read-side PASS, write-side pending;
+no X11 action performed on the login screen is claimed as a successful send.**
 
 ## Upstream used
 
@@ -76,6 +76,15 @@ the upstream worker, not a replacement algorithm.
 - Interrupted `sending` rows are lease-recovered to explicit `failed`/unknown
   delivery state and are not blindly retried.
 - A successful HTTP send response means queued, not WeChat-confirmed.
+- Session rows remain visible as chats even when WeChat has not materialized a
+  corresponding `Msg_*` table.
+- Normalization runs in one thread-local transaction per account and group chats
+  are upserted once with their final member count.
+- Timestamp-only sync changes do not emit duplicate `account.status` events.
+- Core media sync uses local sticker cache only; remote sticker CDN fetches are
+  disabled in the periodic worker so an expired URL cannot stall account sync.
+- Runtime PID lists may contain same-UID helper processes, but key extraction
+  requires at least one verified WeChat process and scans only valid candidates.
 
 ## Runtime/Core handoff compatibility
 
@@ -103,6 +112,11 @@ For more than one registered account, Core refuses display-global WeChat window
 discovery unless the account has `window_id` or a custom controller explicitly
 declares `controller_resolves_account=true`. This is fail-closed behavior to
 reduce cross-account mis-send risk.
+
+The reused controller also fails closed when the resolved surface is a login or
+other non-chat window. A `280x380` login surface reports
+`chat_ready=false`, `login_required=true`; open/paste/image/submit operations are
+rejected before input is delivered.
 
 ## Sender capability boundary
 
@@ -159,8 +173,8 @@ python -m py_compile \
   agent_console/wechat_controller.py \
   tools/wechat-decrypt/find_all_keys_linux.py
 
-python -m unittest discover -s core/tests -v
-# 15 tests passed
+python -m unittest core.tests.test_core -q
+# 19 tests passed
 
 PyYAML parse: docker-compose.yml and ../../stack/docker-compose.yml
 git diff --check
@@ -187,7 +201,11 @@ The tests cover:
 - Runtime-compatible account-ID/path isolation;
 - account-aware controller DISPLAY/window routing;
 - refusal of unverified native quoted replies;
-- refusal of unsafe multi-account global-window discovery.
+- refusal of unsafe multi-account global-window discovery;
+- preservation of session-only chats without `Msg_*` tables;
+- event deduplication across repeated normalization/status updates;
+- local-only sticker sync routing;
+- login-window sender rejection.
 
 ## Source regression meaning
 
@@ -201,24 +219,71 @@ It does **not** prove a real current WeChat database/key can be decrypted on
 this Windows host. That requires the Linux Runtime, logged-in official WeChat
 accounts and process-memory access.
 
-## Real Gate-1 validation still pending
+## Real Gate-1 validation on Unraid
+
+Deployment used the already-running Gate-0 Runtime without restarting it:
 
 ```text
-docker --version
--> 'docker' is not recognized as an internal or external command
-
-ssh unraid ...
--> exit 255 in the current coding-tool session
+Runtime container: wechat-hub-a-gate0-runtime
+Core container:    wechat-core-b-gate1
+Core image:        wechat-core:gate1
+Core API:          127.0.0.1:18081
+PID namespace:     container:<Gate-0 Runtime container id>
+Capability:        SYS_PTRACE
+Core restarts:     0
+Runtime restarts:  0
 ```
 
-Therefore not yet proven here:
+Core uses the Runtime's X11 socket and display-lock inode. Its writable runtime
+data is bound directly from
+`/mnt/disk3/appdata/wechat-hub-b-gate1/session-b/runtime`; the direct disk path
+avoids SQLite WAL `fdatasync` stalls observed through `/mnt/user` FUSE.
 
-- Docker image build / Compose runtime startup;
-- live `/proc/<pid>/mem` key extraction;
-- real WeChat encrypted DB -> decrypted DB regression;
-- real two-account incremental sync;
-- real X11 text/image send;
-- real WeChat echo/reply/file proof.
+No database key value was printed or copied into this report. Metadata-only
+verification found:
+
+| Account | Valid DB key entries | Decrypted DB files | SQLite quick checks |
+|---|---:|---:|---|
+| `gate0-a` | 16 | 13 | session/contact/message: `ok` |
+| `gate0-b` | 15 | 12 | session/contact/message: `ok` |
+
+Normalized real-data results:
+
+| Account | Chats | Contacts | Members | Messages | Ready synced media |
+|---|---:|---:|---:|---:|---:|
+| `gate0-a` | 101 | 4921 | 5112 | 1408 | 91 |
+| `gate0-b` | 100 | 3961 | 4512 | 0 | 0 |
+
+`gate0-b`'s zero messages is not an ingest omission. Its decrypted
+`SessionTable` has 100 rows, while `message_0.db` has an empty `Name2Id` and no
+`Msg_*` tables. The live WAL header/frame salts also differ, so the observed
+frame is stale/invalid and was correctly not applied. The truthful claim is
+session/contact/member synchronization, not historical-message synchronization.
+
+API verification passed for `/health`, `/v1/accounts`, account-scoped chats,
+event poll/ack and media GET. The sampled media response was `200 image/jpeg`
+with 9903 bytes. Two event-count samples 15 seconds apart were identical after
+the deduplication fixes, showing no continuing account/chat event storm.
+
+Both resolved window IDs currently report the login surface:
+
+```text
+gate0-a / 12582967: 280x380, chat_ready=false, login_required=true
+gate0-b / 14680103: 280x380, chat_ready=false, login_required=true
+```
+
+Four earlier self-test outbox rows had been incorrectly marked `sent` by the old
+controller while those login surfaces were active. They are now `failed`, retain
+their original unconfirmed controller evidence, and carry this audit error:
+
+```text
+login screen detected after verification; X11 actions did not reach a logged-in chat
+```
+
+The deployed Runtime also contains Package A's minimized-window recovery fix:
+`start <account_id>` activates the account's existing `Weixin` surface through
+the shared display lock and reports `action: restored`; it does not launch a
+duplicate process.
 
 ## Not reused
 
@@ -231,21 +296,19 @@ Therefore not yet proven here:
 | Any ComWechat/Windows Hook backend | B is derived from the Linux source baseline. |
 | A new decryptor/media decoder | Existing upstream algorithms were retained instead of reimplemented. |
 
-## Gate-1 handoff
+## Remaining Gate-1 handoff
 
-On a Linux Docker host after package A is integrated:
+Only the logged-in write-path proof remains:
 
-1. Start the integrated stack against the already proven two-account Runtime;
-   Core should load A's registry without a separately maintained B registry.
-2. Verify Core dynamically resolves each account's current `pids[]`,
-   `db_storage`, DISPLAY/window and the shared display-lock inode.
-3. Run the automatic/account-scoped key extraction in Runtime's PID namespace.
-4. Run one Core sync and compare the old single-account pipeline against Core
-   for chats, messages, contacts/members and media.
-5. Repeat with both accounts enabled and verify overlapping local IDs remain
-   isolated by `account_id`.
-6. Only then enable the sender and run real X11 text/image tests with the shared
-   Runtime display lock.
+1. Log both official clients back in and leave their main chat windows restored.
+2. Re-run controller status and require `chat_ready=true` plus
+   `login_required=false` for both account-owned window IDs.
+3. Send a new uniquely marked text and PNG only to each account's own
+   `filehelper`, under the Runtime display lock.
+4. Treat X11 completion as an attempt, then wait for the corresponding database
+   increment/echo before declaring WeChat-confirmed delivery.
+5. If `gate0-b` materializes `Msg_*` tables after login, verify its message count
+   advances from zero and remains isolated from `gate0-a`.
 
-Until those steps run on Linux, the correct status is **implementation ready,
-real-WeChat Gate-1 evidence pending**.
+Until that login-dependent proof is observed, the correct status is **real
+two-account Core read path complete; real guarded X11 send/echo pending**.

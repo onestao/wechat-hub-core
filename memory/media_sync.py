@@ -556,6 +556,13 @@ def sync_sticker(row: sqlite3.Row, args) -> dict:
                 "status": "ready",
             }
 
+    if not getattr(args, "download_stickers", True):
+        return {
+            **base,
+            "status": "missing_file",
+            "error": "local sticker cache not found; remote download disabled",
+        }
+
     copied, fmt, width, height, via = download_sticker(info, target_base)
     if copied:
         return {
@@ -664,6 +671,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--media-dir", type=Path, default=Path("runtime/media"))
     parser.add_argument("--config-file", type=Path, default=Path("runtime/wechat-decrypt/config.json"))
     parser.add_argument("--prefer-full-images", action="store_true", help="Prefer full image .dat over thumbnails")
+    parser.add_argument("--no-download-stickers", action="store_true", help="Do not fetch missing stickers from remote URLs")
     return parser.parse_args(argv)
 
 
@@ -674,6 +682,7 @@ def resolve_args(args):
         if not value.is_absolute():
             setattr(args, key, root / value)
     args.prefer_thumbnails = False
+    args.download_stickers = not args.no_download_stickers
     return args
 
 

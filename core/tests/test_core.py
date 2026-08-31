@@ -18,12 +18,15 @@ CORE_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(CORE_ROOT))
 
 from core.app import CoreService, create_server  # noqa: E402
+from core.account_worker import media_args  # noqa: E402
 from core.key_extract import scanner_command  # noqa: E402
 from core.normalize import import_account  # noqa: E402
 from core.registry import AccountRegistry, RegistryError, load_registry, parse_account  # noqa: E402
 from core.runtime_bridge import account_processes, resolve_runtime_account  # noqa: E402
 from core.sender import AccountSender  # noqa: E402
 from core.store import CoreStore  # noqa: E402
+from agent_console.wechat_controller import chat_window_ready  # noqa: E402
+from memory.memory_ingest import ingest_session_chats, init_memory_db  # noqa: E402
 from memory.sync_repair import repair_memory_indexes  # noqa: E402
 
 
@@ -331,6 +334,17 @@ class NormalizationRegressionTest(unittest.TestCase):
         self.assertTrue(all(event["payload"]["message"]["media_id"] == "same-image" for event in image_events))
         self.assertEqual(second["messages"], 4)
         self.assertEqual(second["media"], 1)
+        with self.store.connection() as conn:
+            before_chat_events = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE event_type='chat.updated'"
+            ).fetchone()[0]
+        import_account(self.accounts[0], self.store)
+        import_account(self.accounts[1], self.store)
+        with self.store.connection() as conn:
+            after_chat_events = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE event_type='chat.updated'"
+            ).fetchone()[0]
+        self.assertEqual(after_chat_events, before_chat_events)
 
 
 class SenderRoutingTest(unittest.TestCase):
@@ -484,6 +498,71 @@ class KeyExtractionRoutingTest(unittest.TestCase):
         )
         command = scanner_command(account, root=root)
         self.assertEqual(command[-4:], ["--pid", "4321", "--pid", "4322"])
+
+
+class MediaSyncRoutingTest(unittest.TestCase):
+    def test_core_media_sync_disables_remote_sticker_downloads(self):
+        account = parse_account(
+            {
+                "account_id": "alpha",
+                "source_db_dir": "config/alpha/db_storage",
+            },
+            root=CORE_ROOT / "media-routing-test-root",
+        )
+        self.assertFalse(media_args(account).download_stickers)
+
+
+class SessionOnlyIngestTest(unittest.TestCase):
+    def test_session_without_message_table_remains_visible_as_chat(self):
+        with sqlite3.connect(":memory:") as conn:
+            init_memory_db(conn)
+            inserted = ingest_session_chats(
+                conn,
+                {"contact-a": {"type": 1, "last_timestamp": 123, "sort_timestamp": 456}},
+                {"contact-a": {"display_name": "Contact A"}},
+                set(),
+                Path("session.db"),
+            )
+            row = conn.execute(
+                "SELECT username, display_name, message_table FROM chats WHERE username=?",
+                ("contact-a",),
+            ).fetchone()
+        self.assertEqual(inserted, 1)
+        self.assertEqual(row, ("contact-a", "Contact A", ""))
+
+
+class AccountStatusEventTest(unittest.TestCase):
+    def test_timestamp_only_sync_updates_do_not_emit_duplicate_status_events(self):
+        temp_root = CORE_ROOT / ".tmp" / f"status-event-test-{uuid.uuid4().hex}"
+        temp_root.mkdir(parents=True)
+        try:
+            store = CoreStore(temp_root / "core.sqlite")
+            store.upsert_account(
+                "alpha",
+                "Alpha",
+                state="online",
+                runtime={"display": ":1"},
+                sync={"ok": True, "started_at": "2026-08-31T00:00:00Z", "elapsed_seconds": 1.0},
+            )
+            first = store.poll_events(after="0", limit=20, account_id="alpha")
+            store.upsert_account(
+                "alpha",
+                "Alpha",
+                state="online",
+                runtime={"display": ":1"},
+                sync={"ok": True, "started_at": "2026-08-31T00:01:00Z", "elapsed_seconds": 2.0},
+            )
+            second = store.poll_events(after="0", limit=20, account_id="alpha")
+            self.assertEqual(len(first["events"]), 1)
+            self.assertEqual(len(second["events"]), 1)
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+
+class ControllerLoginGuardTest(unittest.TestCase):
+    def test_login_window_is_not_treated_as_chat_ready(self):
+        self.assertFalse(chat_window_ready({"width": 280, "height": 380}))
+        self.assertTrue(chat_window_ready({"width": 960, "height": 640}))
 
 
 class RegistryIsolationTest(unittest.TestCase):

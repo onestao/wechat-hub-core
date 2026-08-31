@@ -276,6 +276,11 @@ def _resolve_media_path(account: AccountConfig, raw_path: str) -> Path | None:
 
 
 def import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
+    with store.transaction():
+        return _import_account(account, store)
+
+
+def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
     """Normalize the upstream per-account staging SQLite output into Core tables."""
     summary = {"chats": 0, "messages": 0, "message_changes": 0, "contacts": 0, "members": 0, "media": 0}
     if not account.memory_db.exists():
@@ -293,31 +298,24 @@ def import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
         for row in chat_rows:
             chat_id = str(_value(row, "username") or _value(row, "message_table"))
             type_name = "group" if int(_value(row, "is_group", 0) or 0) else "private"
-            store.upsert_chat(
-                {
-                    "account_id": account.account_id,
-                    "chat_id": chat_id,
-                    "type": type_name,
-                    "display_name": _safe_text(_value(row, "display_name") or chat_id),
-                    "updated_at": str(_value(row, "updated_at") or utc_now()),
-                    "vendor_specific": {"source_message_table": _value(row, "message_table", "")},
-                }
-            )
-            summary["chats"] += 1
+            normalized_chat = {
+                "account_id": account.account_id,
+                "chat_id": chat_id,
+                "type": type_name,
+                "display_name": _safe_text(_value(row, "display_name") or chat_id),
+                "updated_at": str(_value(row, "updated_at") or utc_now()),
+                "vendor_specific": {"source_message_table": _value(row, "message_table", "")},
+            }
             if type_name == "group":
-                for member in _load_group_members(contact_db, chat_id, contacts):
+                members = _load_group_members(contact_db, chat_id, contacts)
+                normalized_chat["member_count"] = len(members)
+                store.upsert_chat(normalized_chat)
+                for member in members:
                     store.upsert_member(account.account_id, chat_id, member)
                     summary["members"] += 1
-                refreshed = {
-                    "account_id": account.account_id,
-                    "chat_id": chat_id,
-                    "type": type_name,
-                    "display_name": _safe_text(_value(row, "display_name") or chat_id),
-                    "member_count": store.member_count(account.account_id, chat_id),
-                    "updated_at": str(_value(row, "updated_at") or utc_now()),
-                    "vendor_specific": {"source_message_table": _value(row, "message_table", "")},
-                }
-                store.upsert_chat(refreshed)
+            else:
+                store.upsert_chat(normalized_chat)
+            summary["chats"] += 1
         media_by_message: dict[str, dict[str, str]] = {}
         if _table(conn, "message_media"):
             media_rows = conn.execute("SELECT * FROM message_media WHERE status='ready'").fetchall()

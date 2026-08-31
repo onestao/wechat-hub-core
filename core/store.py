@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -46,6 +47,19 @@ def digest(value: Any) -> str:
     return hashlib.sha256(compact_json(value).encode("utf-8")).hexdigest()
 
 
+def stable_event_value(value: Any) -> Any:
+    """Remove per-run timing fields before comparing account status events."""
+    if isinstance(value, dict):
+        return {
+            key: stable_event_value(item)
+            for key, item in value.items()
+            if key not in {"started_at", "finished_at", "elapsed_seconds"}
+        }
+    if isinstance(value, list):
+        return [stable_event_value(item) for item in value]
+    return value
+
+
 def clean_filename(value: str) -> str:
     name = Path(value or "upload.bin").name.replace("\x00", "")
     return name or "upload.bin"
@@ -54,6 +68,7 @@ def clean_filename(value: str) -> str:
 class CoreStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        self._transaction_state = threading.local()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.init_schema()
 
@@ -66,6 +81,10 @@ class CoreStore:
 
     @contextmanager
     def connection(self):
+        active = getattr(self._transaction_state, "connection", None)
+        if active is not None:
+            yield active
+            return
         conn = self.connect()
         try:
             yield conn
@@ -74,6 +93,25 @@ class CoreStore:
             conn.rollback()
             raise
         finally:
+            conn.close()
+
+    @contextmanager
+    def transaction(self):
+        """Reuse one connection and commit for a thread-local batch of store operations."""
+        active = getattr(self._transaction_state, "connection", None)
+        if active is not None:
+            yield active
+            return
+        conn = self.connect()
+        self._transaction_state.connection = conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            del self._transaction_state.connection
             conn.close()
 
     def init_schema(self) -> None:
@@ -277,7 +315,8 @@ class CoreStore:
                 """,
                 (account_id, display_name, state, compact_json(output["runtime"]), compact_json(output["sync"]), now),
             )
-            if before is None or self._account_row(before) != output:
+            before_value = self._account_row(before) if before is not None else None
+            if before_value is None or stable_event_value(before_value) != stable_event_value(output):
                 self._append_event(conn, account_id, "account.status", {"account": output})
         return output
 

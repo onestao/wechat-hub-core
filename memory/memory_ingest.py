@@ -444,6 +444,51 @@ def ingest_chat(
     return inserted
 
 
+def ingest_session_chats(
+    out_conn: sqlite3.Connection,
+    sessions: dict[str, dict],
+    contacts: dict[str, dict[str, str]],
+    discovered_usernames: set[str],
+    session_db: Path | None,
+) -> int:
+    """Preserve visible sessions even when WeChat has not materialized Msg_* tables yet."""
+    inserted = 0
+    now = utc_now_iso()
+    for username, session in sessions.items():
+        if not username or username in discovered_usernames:
+            continue
+        display_name = contacts.get(username, {}).get("display_name") or username
+        out_conn.execute(
+            """
+            INSERT INTO chats (
+                username, display_name, is_group, session_type, last_timestamp,
+                sort_timestamp, message_table, source_message_db, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(username) DO UPDATE SET
+                display_name=excluded.display_name,
+                is_group=excluded.is_group,
+                session_type=excluded.session_type,
+                last_timestamp=excluded.last_timestamp,
+                sort_timestamp=excluded.sort_timestamp,
+                updated_at=excluded.updated_at
+            """,
+            (
+                username,
+                display_name,
+                1 if username.endswith("@chatroom") else 0,
+                session.get("type"),
+                session.get("last_timestamp"),
+                session.get("sort_timestamp"),
+                "",
+                str(session_db or ""),
+                now,
+            ),
+        )
+        inserted += 1
+    return inserted
+
+
 def resolve_paths(decrypted_dir: Path) -> tuple[list[Path], Path | None, Path | None]:
     message_dir = decrypted_dir / "message"
     message_dbs = sorted(message_dir.glob("message_[0-9]*.db"))
@@ -496,6 +541,7 @@ def ingest_memory(decrypted_dir: Path, memory_db: Path, dry_run: bool = False) -
         run_id = cur.lastrowid
 
         total = 0
+        discovered_usernames = {str(item["chat_username"]) for item in discovered}
         for item in discovered:
             inserted = ingest_chat(
                 out_conn,
@@ -506,6 +552,13 @@ def ingest_memory(decrypted_dir: Path, memory_db: Path, dry_run: bool = False) -
                 sessions,
             )
             total += inserted
+        session_only_chats = ingest_session_chats(
+            out_conn,
+            sessions,
+            contacts,
+            discovered_usernames,
+            session_db,
+        )
 
         chat_count = out_conn.execute("SELECT COUNT(*) FROM chats").fetchone()[0]
         message_count = out_conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
@@ -525,6 +578,7 @@ def ingest_memory(decrypted_dir: Path, memory_db: Path, dry_run: bool = False) -
                 json.dumps(
                     {
                         "tables": discovered,
+                        "session_only_chats": session_only_chats,
                         "upserted_rows": total,
                         "elapsed_seconds": round(time.time() - started_mono, 3),
                         "type_counts": dict(type_rows),
@@ -542,6 +596,7 @@ def ingest_memory(decrypted_dir: Path, memory_db: Path, dry_run: bool = False) -
         "chats": chat_count,
         "messages": message_count,
         "changed_rows": total,
+        "session_only_chats": session_only_chats,
         "pruned_ingest_runs": pruned_runs,
         "type_counts": dict(type_rows),
     }
