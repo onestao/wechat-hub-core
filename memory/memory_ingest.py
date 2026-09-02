@@ -84,6 +84,167 @@ def content_hash(*parts) -> str:
     return h.hexdigest()
 
 
+def source_message_identity(chat_username: str, table_name: str, local_id: int) -> str:
+    """Return the stable source identity for one WeChat message row.
+
+    ``server_id`` and ACK/status fields are deliberately excluded because
+    WeChat mutates them after the first local insert.  A resolved chat username
+    is preferred; the physical message table is only the fallback identity.
+    """
+
+    chat = str(chat_username or "").strip()
+    table = str(table_name or "").strip()
+    scope = f"chat:{chat}" if chat else f"table:{table}"
+    return f"{scope}:local:{int(local_id)}"
+
+
+def _migrate_source_identities(conn: sqlite3.Connection) -> None:
+    """Dedupe pre-migration rows while preserving the first exposed UID."""
+
+    previous_factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "source_identity" not in columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN source_identity TEXT NOT NULL DEFAULT ''")
+
+        rows = conn.execute(
+            "SELECT rowid, message_uid, chat_username, message_table, local_id FROM messages WHERE source_identity=''"
+        ).fetchall()
+        for row in rows:
+            # Older staging rows stored ``message_table`` in chat_username when
+            # Name2Id could not resolve a username. Recover that fallback
+            # distinction where possible.
+            resolved_chat = str(row["chat_username"] or "")
+            if resolved_chat == str(row["message_table"] or ""):
+                resolved_chat = ""
+            identity = source_message_identity(resolved_chat, str(row["message_table"] or ""), int(row["local_id"]))
+            conn.execute(
+                "UPDATE messages SET source_identity=? WHERE rowid=?",
+                (identity, int(row["rowid"])),
+            )
+
+        duplicate_groups = conn.execute(
+            """
+            SELECT source_identity
+            FROM messages
+            WHERE source_identity<>''
+            GROUP BY source_identity
+            HAVING COUNT(*)>1
+            """
+        ).fetchall()
+        mutable_columns = (
+            "chat_username",
+            "chat_display_name",
+            "message_table",
+            "source_message_db",
+            "local_id",
+            "server_id",
+            "local_type",
+            "base_type",
+            "app_subtype",
+            "type_label",
+            "sort_seq",
+            "real_sender_id",
+            "create_time",
+            "status",
+            "upload_status",
+            "download_status",
+            "server_seq",
+            "origin_source",
+            "source",
+            "message_content",
+            "compress_content",
+            "content_sha256",
+            "packed_info_sha256",
+            "ingested_at",
+        )
+        for group in duplicate_groups:
+            duplicates = conn.execute(
+                "SELECT rowid, * FROM messages WHERE source_identity=? ORDER BY rowid ASC",
+                (group["source_identity"],),
+            ).fetchall()
+            if len(duplicates) < 2:
+                continue
+            canonical = duplicates[0]
+
+            def score(row: sqlite3.Row) -> tuple[int, int, str, int]:
+                acked = int(row["server_id"] not in (None, "", 0, "0"))
+                complete = sum(
+                    value not in (None, "", 0, "0")
+                    for value in (
+                        row["server_id"],
+                        row["status"],
+                        row["upload_status"],
+                        row["download_status"],
+                        row["server_seq"],
+                        row["message_content"],
+                        row["compress_content"],
+                        row["packed_info_sha256"],
+                    )
+                )
+                return acked, complete, str(row["ingested_at"] or ""), int(row["rowid"])
+
+            best = max(duplicates, key=score)
+            assignments = ", ".join(f"{name}=?" for name in mutable_columns)
+            conn.execute(
+                f"UPDATE messages SET {assignments} WHERE rowid=?",
+                tuple(best[name] for name in mutable_columns) + (int(canonical["rowid"]),),
+            )
+
+            canonical_uid = str(canonical["message_uid"])
+            for duplicate in duplicates[1:]:
+                duplicate_uid = str(duplicate["message_uid"])
+                canonical_media = conn.execute(
+                    "SELECT * FROM message_media WHERE message_uid=?", (canonical_uid,)
+                ).fetchone()
+                duplicate_media = conn.execute(
+                    "SELECT * FROM message_media WHERE message_uid=?", (duplicate_uid,)
+                ).fetchone()
+                if duplicate_media is not None and canonical_media is None:
+                    conn.execute(
+                        """
+                        UPDATE message_media
+                        SET message_uid=?, chat_username=?, local_id=?
+                        WHERE message_uid=?
+                        """,
+                        (
+                            canonical_uid,
+                            str(canonical["chat_username"]),
+                            int(canonical["local_id"]),
+                            duplicate_uid,
+                        ),
+                    )
+                elif duplicate_media is not None and canonical_media is not None:
+                    use_duplicate = (
+                        str(duplicate_media["status"] or "") == "ready"
+                        and str(canonical_media["status"] or "") != "ready"
+                    ) or str(duplicate_media["updated_at"] or "") > str(canonical_media["updated_at"] or "")
+                    if use_duplicate:
+                        media_columns = (
+                            "media_type",
+                            "original_md5",
+                            "source_path",
+                            "media_path",
+                            "thumb_path",
+                            "mime_type",
+                            "width",
+                            "height",
+                            "status",
+                            "error",
+                            "updated_at",
+                        )
+                        media_assignments = ", ".join(f"{name}=?" for name in media_columns)
+                        conn.execute(
+                            f"UPDATE message_media SET {media_assignments} WHERE message_uid=?",
+                            tuple(duplicate_media[name] for name in media_columns) + (canonical_uid,),
+                        )
+                    conn.execute("DELETE FROM message_media WHERE message_uid=?", (duplicate_uid,))
+                conn.execute("DELETE FROM messages WHERE rowid=?", (int(duplicate["rowid"]),))
+    finally:
+        conn.row_factory = previous_factory
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -194,6 +355,7 @@ def init_memory_db(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS messages (
             message_uid TEXT PRIMARY KEY,
+            source_identity TEXT NOT NULL DEFAULT '',
             chat_username TEXT NOT NULL,
             chat_display_name TEXT,
             message_table TEXT NOT NULL,
@@ -261,6 +423,10 @@ def init_memory_db(conn: sqlite3.Connection) -> None:
             details_json TEXT NOT NULL DEFAULT '{}'
         );
         """
+    )
+    _migrate_source_identities(conn)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_identity ON messages(source_identity)"
     )
 
 
@@ -369,26 +535,29 @@ def ingest_chat(
             decoded_content = decompress_content(message_content, content_ct)
             decoded_compress = decompress_content(compress_content, None)
             base_type, app_subtype = split_msg_type(local_type)
-            uid = content_hash(chat_username or table_name, table_name, local_id, server_id, create_time)
+            identity = source_message_identity(chat_username, table_name, local_id)
+            existing = out_conn.execute(
+                "SELECT message_uid, content_sha256, packed_info_sha256 FROM messages WHERE source_identity=?",
+                (identity,),
+            ).fetchone()
+            uid = str(existing[0]) if existing is not None else content_hash(identity)
             body_hash = content_hash(decoded_content, decoded_compress, source, local_type)
             packed_hash = content_hash(packed_info_data) if packed_info_data is not None else None
 
-            before = out_conn.execute(
-                "SELECT content_sha256, packed_info_sha256 FROM messages WHERE message_uid=?",
-                (uid,),
-            ).fetchone()
+            before = existing[1:3] if existing is not None else None
             out_conn.execute(
                 """
                 INSERT INTO messages (
-                    message_uid, chat_username, chat_display_name, message_table,
+                    message_uid, source_identity, chat_username, chat_display_name, message_table,
                     source_message_db, local_id, server_id, local_type, base_type,
                     app_subtype, type_label, sort_seq, real_sender_id, create_time,
                     status, upload_status, download_status, server_seq, origin_source,
                     source, message_content, compress_content, content_sha256,
                     packed_info_sha256, ingested_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(message_uid) DO UPDATE SET
+                    source_identity=excluded.source_identity,
                     chat_display_name=excluded.chat_display_name,
                     server_id=excluded.server_id,
                     local_type=excluded.local_type,
@@ -412,6 +581,7 @@ def ingest_chat(
                 """,
                 (
                     uid,
+                    identity,
                     chat_username or table_name,
                     display_name,
                     table_name,

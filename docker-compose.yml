@@ -85,7 +85,6 @@ services:
       - "${AI_MEMORY_BIND:-127.0.0.1}:${AI_MEMORY_PORT:-8090}:8090"
     volumes:
       - ./runtime:/app/runtime
-      - /var/run/docker.sock:/var/run/docker.sock:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     command:
@@ -115,7 +114,6 @@ services:
       - "${AGENT_CONSOLE_BIND:-127.0.0.1}:${AGENT_CONSOLE_PORT:-8078}:8078"
     volumes:
       - ./runtime:/app/runtime
-      - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - WECHAT_SOURCE_DB_DIR=/app/config/xwechat_files/${WECHAT_ACCOUNT_DIR_NAME:-PLEASE_SET_WECHAT_ACCOUNT_DIR}/db_storage
     extra_hosts:

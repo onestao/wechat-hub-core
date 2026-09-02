@@ -30,6 +30,19 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def parse_rfc3339(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -174,6 +187,8 @@ class CoreStore:
                     account_id TEXT NOT NULL,
                     message_id TEXT NOT NULL,
                     chat_id TEXT NOT NULL,
+                    source_local_id TEXT NOT NULL DEFAULT '',
+                    source_message_table TEXT NOT NULL DEFAULT '',
                     type TEXT NOT NULL,
                     direction TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -249,6 +264,126 @@ class CoreStore:
             outbox_columns = {row[1] for row in conn.execute("PRAGMA table_info(outbox)")}
             if "request_digest" not in outbox_columns:
                 conn.execute("ALTER TABLE outbox ADD COLUMN request_digest TEXT NOT NULL DEFAULT ''")
+            message_columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+            if "source_local_id" not in message_columns:
+                conn.execute("ALTER TABLE messages ADD COLUMN source_local_id TEXT NOT NULL DEFAULT ''")
+            if "source_message_table" not in message_columns:
+                conn.execute("ALTER TABLE messages ADD COLUMN source_message_table TEXT NOT NULL DEFAULT ''")
+            self._migrate_message_source_identity(conn)
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_identity
+                ON messages(account_id, chat_id, source_local_id)
+                WHERE source_local_id<>''
+                """
+            )
+
+    @staticmethod
+    def _message_migration_score(row: sqlite3.Row) -> tuple[int, int, int]:
+        vendor = parse_json(row["vendor_json"], {})
+        if not isinstance(vendor, dict):
+            vendor = {}
+        server_id = vendor.get("source_server_id")
+        acked = int(server_id not in (None, "", 0, "0"))
+        complete = sum(
+            bool(row[name])
+            for name in (
+                "text",
+                "media_id",
+                "filename",
+                "mime_type",
+                "target_message_id",
+                "attributes_json",
+                "vendor_json",
+            )
+        )
+        return acked, complete, int(row["rowid"])
+
+    def _migrate_message_source_identity(self, conn: sqlite3.Connection) -> None:
+        """Backfill and dedupe normalized rows created before source identity existed.
+
+        The oldest existing Core ``message_id`` is canonical because it may
+        already have been exposed to Console/EFB.  Mutable/message content is
+        refreshed from the most complete/newest duplicate before the duplicate
+        row is removed.
+        """
+
+        rows = conn.execute(
+            "SELECT rowid, message_id, vendor_json FROM messages WHERE source_local_id=''"
+        ).fetchall()
+        for row in rows:
+            vendor = parse_json(row["vendor_json"], {})
+            if not isinstance(vendor, dict):
+                continue
+            local_id = vendor.get("source_local_id")
+            if local_id in (None, ""):
+                continue
+            conn.execute(
+                "UPDATE messages SET source_local_id=?, source_message_table=? WHERE rowid=?",
+                (
+                    str(local_id),
+                    str(vendor.get("source_message_table") or ""),
+                    int(row["rowid"]),
+                ),
+            )
+
+        duplicate_groups = conn.execute(
+            """
+            SELECT account_id, chat_id, source_local_id
+            FROM messages
+            WHERE source_local_id<>''
+            GROUP BY account_id, chat_id, source_local_id
+            HAVING COUNT(*)>1
+            """
+        ).fetchall()
+        optional_fields = ("text", "media_id", "filename", "mime_type", "target_message_id")
+        for group in duplicate_groups:
+            duplicates = conn.execute(
+                """
+                SELECT rowid, * FROM messages
+                WHERE account_id=? AND chat_id=? AND source_local_id=?
+                ORDER BY rowid ASC
+                """,
+                (group["account_id"], group["chat_id"], group["source_local_id"]),
+            ).fetchall()
+            if len(duplicates) < 2:
+                continue
+            canonical = duplicates[0]
+            best = max(duplicates, key=self._message_migration_score)
+            merged_optional = {
+                name: best[name] if best[name] not in (None, "") else canonical[name]
+                for name in optional_fields
+            }
+            conn.execute(
+                """
+                UPDATE messages SET
+                    source_message_table=?, type=?, direction=?, created_at=?, author_json=?,
+                    text=?, media_id=?, filename=?, mime_type=?, target_message_id=?,
+                    substitutions_json=?, attributes_json=?, vendor_json=?, digest=?
+                WHERE rowid=?
+                """,
+                (
+                    best["source_message_table"] or canonical["source_message_table"],
+                    best["type"],
+                    best["direction"],
+                    best["created_at"],
+                    best["author_json"],
+                    merged_optional["text"],
+                    merged_optional["media_id"],
+                    merged_optional["filename"],
+                    merged_optional["mime_type"],
+                    merged_optional["target_message_id"],
+                    best["substitutions_json"],
+                    best["attributes_json"],
+                    best["vendor_json"],
+                    best["digest"],
+                    int(canonical["rowid"]),
+                ),
+            )
+            conn.executemany(
+                "DELETE FROM messages WHERE rowid=?",
+                [(int(row["rowid"]),) for row in duplicates[1:]],
+            )
 
     def _append_event(self, conn: sqlite3.Connection, account_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         occurred_at = utc_now()
@@ -502,6 +637,84 @@ class CoreStore:
             output["vendor_specific"] = vendor
         return output
 
+    def _reconcile_text_echo(self, conn: sqlite3.Connection, message: dict[str, Any]) -> str:
+        """Conservatively link one outgoing text to one submitted outbox row.
+
+        The X11 controller cannot return a WeChat message ID.  We therefore
+        only reconcile when there is exactly one recent, already-submitted,
+        plain-text candidate with an exact text match.  Mention sends are
+        skipped because the GUI may materialize the blue mention differently
+        from the request text.  Ambiguity intentionally leaves the send
+        unconfirmed rather than risking a false echo mapping.
+        """
+        if message.get("direction") != "outgoing" or message.get("type") != "text":
+            return ""
+        text = str(message.get("text") or "").strip()
+        message_id = str(message.get("message_id") or "").strip()
+        message_time = parse_rfc3339(str(message.get("created_at") or ""))
+        if not text or not message_id or message_time is None:
+            return ""
+
+        rows = conn.execute(
+            """
+            SELECT * FROM outbox
+            WHERE account_id=? AND chat_id=? AND kind='text'
+              AND status='submitted' AND echo_message_id=''
+            ORDER BY updated_at DESC
+            LIMIT 20
+            """,
+            (str(message["account_id"]), str(message["chat_id"])),
+        ).fetchall()
+        candidates: list[sqlite3.Row] = []
+        for row in rows:
+            request = parse_json(row["request_json"], {})
+            if not isinstance(request, dict):
+                continue
+            if request.get("mention_member_ids"):
+                continue
+            if str(request.get("text") or "").strip() != text:
+                continue
+            sent_time = parse_rfc3339(str(row["updated_at"] or row["accepted_at"] or ""))
+            if sent_time is None:
+                continue
+            delta = (message_time - sent_time).total_seconds()
+            if -10 <= delta <= 180:
+                candidates.append(row)
+        if len(candidates) != 1:
+            return ""
+
+        row = candidates[0]
+        now = utc_now()
+        details = parse_json(row["details_json"], {})
+        if not isinstance(details, dict):
+            details = {}
+        details["echo_reconciliation"] = {
+            "method": "unique_exact_text",
+            "message_id": message_id,
+            "matched_at": now,
+        }
+        details["delivery_certainty"] = "confirmed"
+        details["automatic_retry"] = False
+        changed = conn.execute(
+            """
+            UPDATE outbox
+            SET status='sent', echo_message_id=?, details_json=?, error='', updated_at=?
+            WHERE send_id=? AND status='submitted' AND echo_message_id=''
+            """,
+            (message_id, compact_json(details), now, row["send_id"]),
+        ).rowcount
+        if changed != 1:
+            return ""
+        updated = conn.execute("SELECT * FROM outbox WHERE send_id=?", (row["send_id"],)).fetchone()
+        receipt = self._receipt(updated)
+        self._append_event(
+            conn,
+            str(message["account_id"]),
+            "send.updated",
+            {"send": receipt, "details": {"echo_reconciliation": details["echo_reconciliation"]}},
+        )
+        return str(row["send_id"])
+
     def upsert_message(self, message: dict[str, Any]) -> str:
         required = ("account_id", "message_id", "chat_id", "type", "direction", "created_at", "author")
         if any(not message.get(key) for key in required):
@@ -516,6 +729,8 @@ class CoreStore:
             "account_id": account_id,
             "message_id": message_id,
             "chat_id": str(message["chat_id"]),
+            "source_local_id": "",
+            "source_message_table": "",
             "type": str(message["type"]),
             "direction": str(message["direction"]),
             "created_at": str(message["created_at"]),
@@ -529,30 +744,56 @@ class CoreStore:
             "attributes": message.get("attributes") if isinstance(message.get("attributes"), dict) else {},
             "vendor_specific": message.get("vendor_specific") if isinstance(message.get("vendor_specific"), dict) else {},
         }
-        value_digest = digest(value)
+        source_local_id = value["vendor_specific"].get("source_local_id")
+        if source_local_id not in (None, ""):
+            value["source_local_id"] = str(source_local_id)
+        value["source_message_table"] = str(value["vendor_specific"].get("source_message_table") or "")
         with self.connection() as conn:
+            if value["source_local_id"]:
+                canonical = conn.execute(
+                    """
+                    SELECT message_id FROM messages
+                    WHERE account_id=? AND chat_id=? AND source_local_id=?
+                    LIMIT 1
+                    """,
+                    (account_id, value["chat_id"], value["source_local_id"]),
+                ).fetchone()
+                if canonical is not None:
+                    value["message_id"] = str(canonical["message_id"])
+                    message_id = value["message_id"]
+            value_digest = digest(value)
             before = conn.execute("SELECT digest FROM messages WHERE account_id=? AND message_id=?", (account_id, message_id)).fetchone()
             conn.execute(
                 """
                 INSERT INTO messages (
-                    account_id, message_id, chat_id, type, direction, created_at, author_json, text, media_id,
+                    account_id, message_id, chat_id, source_local_id, source_message_table,
+                    type, direction, created_at, author_json, text, media_id,
                     filename, mime_type, target_message_id, substitutions_json, attributes_json, vendor_json, digest
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, message_id) DO UPDATE SET
-                    chat_id=excluded.chat_id, type=excluded.type, direction=excluded.direction, created_at=excluded.created_at,
+                    chat_id=excluded.chat_id, source_local_id=excluded.source_local_id,
+                    source_message_table=excluded.source_message_table,
+                    type=excluded.type, direction=excluded.direction, created_at=excluded.created_at,
                     author_json=excluded.author_json, text=excluded.text, media_id=excluded.media_id,
                     filename=excluded.filename, mime_type=excluded.mime_type, target_message_id=excluded.target_message_id,
                     substitutions_json=excluded.substitutions_json, attributes_json=excluded.attributes_json,
                     vendor_json=excluded.vendor_json, digest=excluded.digest
                 """,
                 (
-                    account_id, message_id, value["chat_id"], value["type"], value["direction"], value["created_at"],
+                    account_id, message_id, value["chat_id"], value["source_local_id"], value["source_message_table"],
+                    value["type"], value["direction"], value["created_at"],
                     compact_json(author), value["text"], value["media_id"], value["filename"], value["mime_type"],
                     value["target_message_id"], compact_json(value["substitutions"]), compact_json(value["attributes"]),
                     compact_json(value["vendor_specific"]), value_digest,
                 ),
             )
             event_type = "message.created" if before is None else "message.updated"
+            # Emit a successful echo link before the corresponding
+            # message.created event.  Consumers such as EFB can then learn the
+            # send_id -> WeChat message_id alias before deciding whether this
+            # outgoing message is a native self-message or the echo of their
+            # own send.
+            self._reconcile_text_echo(conn, value)
             if before is None or before["digest"] != value_digest:
                 self._append_event(conn, account_id, event_type, {"message": value})
         return "created" if before is None else "updated" if before["digest"] != value_digest else "unchanged"
@@ -791,6 +1032,12 @@ class CoreStore:
             receipt["client_request_id"] = row["client_request_id"]
         if row["echo_message_id"]:
             receipt["echo_message_id"] = row["echo_message_id"]
+        details = parse_json(row["details_json"], {})
+        if isinstance(details, dict):
+            if details.get("delivery_certainty"):
+                receipt["delivery_certainty"] = details["delivery_certainty"]
+            if "automatic_retry" in details:
+                receipt["automatic_retry"] = bool(details["automatic_retry"])
         return receipt
 
     def pending_sends(self, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -799,6 +1046,45 @@ class CoreStore:
                 "SELECT * FROM outbox WHERE status IN ('accepted', 'queued') ORDER BY accepted_at LIMIT ?", (max(1, min(limit, 200)),)
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def fail_pending_sends_for_account(self, account_id: str, *, reason: str) -> int:
+        """Fail only not-yet-dispatched sends when an account leaves the live registry.
+
+        ``sending`` rows are deliberately not rewritten here because GUI delivery may
+        already have happened; their existing lease recovery keeps that uncertainty
+        explicit instead of risking a duplicate send.
+        """
+        failed = 0
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM outbox WHERE account_id=? AND status IN ('accepted', 'queued') ORDER BY accepted_at",
+                (account_id,),
+            ).fetchall()
+            for row in rows:
+                details = parse_json(row["details_json"], {})
+                if not isinstance(details, dict):
+                    details = {}
+                details["registry"] = {"reason": "account_unregistered"}
+                conn.execute(
+                    "UPDATE outbox SET status='failed', details_json=?, error=?, updated_at=? WHERE send_id=? AND status IN ('accepted', 'queued')",
+                    (compact_json(details), reason, utc_now(), row["send_id"]),
+                )
+                updated = conn.execute("SELECT * FROM outbox WHERE send_id=?", (row["send_id"],)).fetchone()
+                if updated["status"] != "failed":
+                    continue
+                receipt = self._receipt(updated)
+                self._append_event(
+                    conn,
+                    account_id,
+                    "send.updated",
+                    {
+                        "send": receipt,
+                        "details": details,
+                        "error": {"code": "account_unregistered", "message": reason},
+                    },
+                )
+                failed += 1
+        return failed
 
     def recover_stale_sends(self, *, max_age_seconds: float = 120.0) -> int:
         """Fail interrupted in-flight sends after their lease instead of wedging forever.
@@ -844,8 +1130,71 @@ class CoreStore:
                 recovered += 1
         return recovered
 
+    def expire_submitted_sends(self, *, max_age_seconds: float = 120.0) -> int:
+        """Turn unconfirmed submissions into durable uncertainty without retrying.
+
+        ``submitted`` means the sender/FSM returned success but Core has not
+        observed a unique WeChat DB echo.  Once the confirmation window closes,
+        retrying automatically would risk a duplicate message.
+        """
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=max(1.0, float(max_age_seconds)))).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
+        expired = 0
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM outbox WHERE status='submitted' AND updated_at<=? ORDER BY updated_at",
+                (cutoff,),
+            ).fetchall()
+            for row in rows:
+                details = parse_json(row["details_json"], {})
+                if not isinstance(details, dict):
+                    details = {}
+                details["delivery_certainty"] = "unknown"
+                details["automatic_retry"] = False
+                details["confirmation"] = {
+                    "reason": "db_echo_timeout",
+                    "previous_updated_at": row["updated_at"],
+                    "window_seconds": max(1.0, float(max_age_seconds)),
+                }
+                error = (
+                    "sender reported submission success, but WeChat DB/Core did not observe "
+                    "a unique outgoing echo within the confirmation window"
+                )
+                changed = conn.execute(
+                    """
+                    UPDATE outbox
+                    SET status='uncertain', details_json=?, error=?, updated_at=?
+                    WHERE send_id=? AND status='submitted'
+                    """,
+                    (compact_json(details), error, utc_now(), row["send_id"]),
+                ).rowcount
+                if changed != 1:
+                    continue
+                updated = conn.execute("SELECT * FROM outbox WHERE send_id=?", (row["send_id"],)).fetchone()
+                self._append_event(
+                    conn,
+                    str(updated["account_id"]),
+                    "send.updated",
+                    {
+                        "send": self._receipt(updated),
+                        "details": details,
+                        "error": {"code": "delivery_confirmation_timeout", "message": error},
+                    },
+                )
+                expired += 1
+        return expired
+
     def transition_send(
-        self, send_id: str, status: str, *, details: dict[str, Any] | None = None, error: str = "", echo_message_id: str = ""
+        self,
+        send_id: str,
+        status: str,
+        *,
+        details: dict[str, Any] | None = None,
+        error: str = "",
+        error_code: str = "sender_failed",
+        echo_message_id: str = "",
     ) -> dict[str, Any]:
         with self.connection() as conn:
             row = conn.execute("SELECT * FROM outbox WHERE send_id=?", (send_id,)).fetchone()
@@ -864,7 +1213,7 @@ class CoreStore:
             if details:
                 payload["details"] = details
             if error:
-                payload["error"] = {"code": "sender_failed", "message": error}
+                payload["error"] = {"code": error_code or "sender_failed", "message": error}
             self._append_event(conn, updated["account_id"], "send.updated", payload)
         return receipt
 

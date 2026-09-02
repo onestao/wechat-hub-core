@@ -319,53 +319,16 @@ def clear_focused_text() -> None:
 
 def chat_search_query(chat_name: str) -> str:
     compact = re.sub(r"\s+", "", chat_name.strip())
-    lowered = compact.lower()
-    if "pt站看片狂魔小群" in lowered or lowered.startswith("pt"):
-        return "PT"
-    if "值班群" in compact or compact.startswith("值班"):
-        return "值班"
-    if "测试群" in compact or compact.startswith("测试"):
-        return "测试"
-    ascii_prefix = re.match(r"[A-Za-z0-9_-]{2,}", compact)
-    if ascii_prefix:
-        return ascii_prefix.group(0)[:2]
-    return compact[:2] or chat_name.strip()
+    return compact or chat_name.strip()
 
 
 def open_chat(chat_name: str, switch_delay: float) -> dict:
     chat_name = chat_name.strip()
     if not chat_name:
         raise RuntimeError("缺少目标群名")
-    search_query = chat_search_query(chat_name)
-    window = find_main_window()
-    require_chat_window(window)
-    activate(window)
-    width = int(window["width"])
-    height = int(window["height"])
-
-    key("Escape")
-    sleep_seconds(0.08)
-    click(window, *chat_tab_point(window))
-    sleep_seconds(0.15)
-
-    click(window, *search_box_point(window))
-    sleep_seconds(0.1)
-    clear_focused_text()
-    paste_text(search_query)
-    sleep_seconds(0.55)
-
-    # Short local queries ("PT", "值班") highlight the exact recent chat. Full
-    # names can trigger WeChat's global search page instead.
-    key("Return")
-    sleep_seconds(max(switch_delay, 0.2))
-    return {
-        "window": window,
-        "chat_name": chat_name,
-        "search_query": search_query,
-        "switch_delay_seconds": switch_delay,
-        "width": width,
-        "height": height,
-    }
+    raise RuntimeError(
+        "当前 X11 控制器无法验证搜索结果是否为精确目标聊天；已拒绝切换和发送"
+    )
 
 
 def paste_active(text: str, send: bool, send_delay: float) -> dict:

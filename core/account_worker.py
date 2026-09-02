@@ -67,9 +67,10 @@ class AccountWorker:
             from memory.sync_repair import repair_memory_indexes
 
             key_extract: dict[str, Any] | None = None
-            if account.runtime.get("runtime_bridge") and (
+            needs_key_refresh = account.runtime_provider == "agent_wechat" or (
                 not account.keys_file.is_file() or account.keys_file.stat().st_size == 0
-            ):
+            )
+            if account.runtime.get("runtime_bridge") and needs_key_refresh:
                 if not account.source_db_dir.is_dir():
                     raise RuntimeError(
                         f"Runtime account source db_storage is not available yet: {account.source_db_dir}"
@@ -116,17 +117,33 @@ class AccountWorker:
                 }
             )
             state = "online" if status["ok"] else "degraded"
+            if (
+                account.runtime_provider == "agent_wechat"
+                and account.runtime.get("agent_server_healthy") is False
+            ):
+                state = "degraded"
+                status["runtime_health_error"] = str(
+                    account.runtime.get("health_error") or "agent-wechat agent-server is unhealthy"
+                )
         except Exception as exc:  # Sync failures are account-scoped and must not stop peer accounts.
             status["error"] = str(exc)
             state = "error"
         status["finished_at"] = now_iso()
         status["elapsed_seconds"] = round(time.monotonic() - started, 3)
         write_json(account.sync_status_file, status)
+        # Registry hot-removal can happen while a long decrypt/media cycle is
+        # running.  Do not resurrect an account row as online after it has
+        # already been removed from the live Runtime registry.
+        if self.registry.get(account.account_id) is None:
+            status["deregistered_during_sync"] = True
+            return status
+        public_runtime = account.public_runtime()
+        public_runtime["registered"] = True
         self.store.upsert_account(
             account.account_id,
             account.display_name,
             state=state,
-            runtime=account.public_runtime(),
+            runtime=public_runtime,
             sync=status,
         )
         return status

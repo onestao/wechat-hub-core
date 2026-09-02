@@ -118,6 +118,28 @@ other non-chat window. A `280x380` login surface reports
 `chat_ready=false`, `login_required=true`; open/paste/image/submit operations are
 rejected before input is delivered.
 
+### Registry hot reload and Runtime lifecycle management
+
+The Runtime registry is no longer a permanent startup snapshot. Core keeps one
+thread-safe `AccountRegistry` object shared by sync and sender loops, watches
+the persisted Runtime registry by content fingerprint (default every 1 second),
+and atomically replaces that object's account snapshot when the file changes.
+Direct Runtime CLI register/unregister changes therefore join/leave subsequent
+Core sync/sender cycles without restarting Core.
+
+For Console operator actions, Core also consumes Runtime's private
+`/run/wechat-runtime/control.sock` Unix socket and exposes an additive
+`/v1/runtime/*` HTTP extension. Console-driven create/remove forces the same
+registry reload synchronously. Core does not receive Docker Socket access.
+
+Removal semantics are deliberately conservative: the removed account is hidden
+from active `/v1/accounts` while its historical normalized rows remain in Core;
+accepted/queued sends that never reached the sender fail explicitly. A row
+already in `sending` state is not guessed or automatically retried because GUI
+delivery may already have happened. A sync cycle that finishes after removal
+also checks the live registry before updating status, preventing the account
+from being resurrected by a stale worker iteration.
+
 ## Sender capability boundary
 
 Verified from the existing source primitives and host fakes:
@@ -135,13 +157,26 @@ Not falsely implemented:
 ```text
 native target_message_id quoted reply
 arbitrary file-paste delivery
-WeChat echo confirmation
+hard/verified WeChat echo confirmation
 ```
 
 The current upstream X11 controller does not provide verified primitives for
 the last three. Core therefore preserves the request in its durable outbox but
 marks execution failed instead of silently sending a semantically different
-message. These items remain Gate 3 integration work.
+message. These items remain Gate 3 integration work. Core now also exposes
+these concrete limitations through the additive V1 `/health`
+`sender_capabilities` field so adapters can avoid knowingly queuing unsupported
+operations; the request schemas themselves remain unchanged.
+
+Post-integration review added a conservative **plain-text echo reconciliation**
+path for the already-synced outgoing database record: it links a `sent` outbox
+row only when account, chat, exact text and a short time window produce exactly
+one candidate, and deliberately refuses ambiguous/mention matches. The
+resulting `send.updated` event is emitted before the matching
+`message.created`, which lets C learn the `send_id -> echo_message_id` alias
+before deciding whether an outgoing message is native or its own echo. This is
+still not advertised as hard echo confirmation and remains a Gate-3 live
+validation item until proven against real logged-in WeChat traffic.
 
 ## HTTP contract implemented
 
@@ -159,6 +194,26 @@ POST /v1/send/image
 POST /v1/send/file
 ```
 
+It additionally implements the optional operator-only V1 extension used by the
+Console when Runtime management is available:
+
+```text
+GET    /v1/runtime/accounts
+POST   /v1/runtime/accounts
+POST   /v1/runtime/accounts/{account_id}/start|stop|restart
+DELETE /v1/runtime/accounts/{account_id}
+GET    /v1/runtime/accounts/{account_id}/login
+GET    /v1/runtime/accounts/{account_id}/login/snapshot
+```
+
+C/E do not depend on this extension; absence remains compatible with their
+frozen Core V1 data/message boundary.
+
+The login endpoints remain operator-only and ephemeral. Core requests an
+account-scoped window snapshot from Runtime's private Unix socket, validates
+the bounded PNG, and serves it with `Cache-Control: no-store`; Core does not
+write the login image to its DB or media storage.
+
 C/D/E do not need and must not receive Core SQLite access.
 
 ## Regression validation
@@ -174,7 +229,7 @@ python -m py_compile \
   tools/wechat-decrypt/find_all_keys_linux.py
 
 python -m unittest core.tests.test_core -q
-# 19 tests passed
+# 24 tests passed
 
 PyYAML parse: docker-compose.yml and ../../stack/docker-compose.yml
 git diff --check
@@ -312,3 +367,31 @@ Only the logged-in write-path proof remains:
 
 Until that login-dependent proof is observed, the correct status is **real
 two-account Core read path complete; real guarded X11 send/echo pending**.
+
+## 2026-09-01 sender incident superseding the write-path plan
+
+The planned live `filehelper` test exposed an unsafe upstream-controller
+assumption. `chat_search_query("文件传输助手")` returned `文件`, and `open_chat()`
+pressed Return on the first result without verifying the active chat title. The
+user reported that test content appeared in a group instead of File Transfer
+Assistant. Therefore the Gate-1 write path is **failed and disabled**, not
+pending a retry.
+
+Containment and correction:
+
+- stopped only `wechat-core-b-gate1`; the Gate-0 Runtime and both official
+  clients remained running;
+- corrected the four incident outbox rows from `sent` to `failed` with an audit
+  reason and confirmed no pending/sending rows remained;
+- preserved the old container as `wechat-core-b-gate1-incident-stopped`;
+- deployed `wechat-core:gate1-safe` with `--send-interval 0`;
+- changed the controller `open` action to fail before any X11 input;
+- made Core require `controller_verifies_chat_target=true` before text/image
+  dispatch; the current Runtime/controller does not provide that capability;
+- changed advertised text/image/file capabilities to false;
+- passed 26/26 local regression tests.
+
+No further live send testing is permitted until a replacement controller can
+independently verify the exact active chat before paste and submit. Database
+echo matching is post-send evidence and cannot compensate for unsafe target
+selection.

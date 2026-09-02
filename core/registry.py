@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,34 @@ from typing import Any
 
 ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 LEGACY_PLACEHOLDER = "PLEASE_SET_WECHAT_ACCOUNT_DIR"
+
+
+def provider_sender_capabilities(provider: str) -> dict[str, Any]:
+    """Return conservative public sender capabilities for one runtime provider."""
+
+    if provider == "agent_wechat":
+        return {
+            "text": True,
+            "image": True,
+            "file": True,
+            "native_reply": False,
+            "media_caption": False,
+            "max_mentions": 0,
+            "echo_confirmation": False,
+            "verified_chat_target": True,
+            "driver": "agent_wechat",
+        }
+    return {
+        "text": False,
+        "image": False,
+        "file": False,
+        "native_reply": False,
+        "media_caption": False,
+        "max_mentions": 0,
+        "echo_confirmation": False,
+        "verified_chat_target": False,
+        "driver": "legacy",
+    }
 
 
 class RegistryError(ValueError):
@@ -60,10 +89,16 @@ class AccountConfig:
     def sender_enabled(self) -> bool:
         return bool(self.runtime.get("sender_enabled", False))
 
+    @property
+    def runtime_provider(self) -> str:
+        return str(self.runtime.get("runtime_provider") or "legacy")
+
     def public_runtime(self) -> dict[str, Any]:
         runtime = dict(self.runtime)
         runtime.pop("controller_command", None)
         runtime.pop("key_file", None)
+        runtime.pop("agent_wechat_token_file", None)
+        runtime.setdefault("sender_capabilities", provider_sender_capabilities(self.runtime_provider))
         runtime["display"] = self.display
         if self.window_id:
             runtime["window_id"] = self.window_id
@@ -74,18 +109,27 @@ class AccountRegistry:
     def __init__(self, accounts: list[AccountConfig], source_path: Path) -> None:
         self._accounts = {account.account_id: account for account in accounts}
         self.source_path = source_path
+        self._lock = threading.RLock()
 
     def all(self) -> list[AccountConfig]:
-        return list(self._accounts.values())
+        with self._lock:
+            return list(self._accounts.values())
 
     def get(self, account_id: str) -> AccountConfig | None:
-        return self._accounts.get(account_id)
+        with self._lock:
+            return self._accounts.get(account_id)
 
     def require(self, account_id: str) -> AccountConfig:
         account = self.get(account_id)
         if account is None:
             raise RegistryError(f"Unknown account_id: {account_id}")
         return account
+
+    def replace_from(self, other: "AccountRegistry") -> None:
+        """Atomically replace the live account snapshot while keeping callers' reference stable."""
+        with self._lock:
+            self._accounts = {account.account_id: account for account in other.all()}
+            self.source_path = other.source_path
 
 
 def parse_account(item: object, *, root: Path) -> AccountConfig:
@@ -149,20 +193,46 @@ def parse_runtime_account(item: object, *, root: Path, registry_path: Path) -> A
     if not ACCOUNT_ID_RE.fullmatch(account_id):
         raise RegistryError("Runtime account id may contain only letters, digits, '_', '.' and '-'")
     display = _text(item.get("display"), "display") or ":1"
+    provider = _text(item.get("runtime_provider"), "runtime_provider") or "legacy"
+    if provider not in {"legacy", "agent_wechat"}:
+        raise RegistryError(f"unsupported Runtime provider for {account_id}: {provider}")
     config_root = _runtime_config_root(registry_path)
     home = _translate_runtime_home(_text(item.get("home"), "home", required=True), config_root=config_root)
     unresolved_base = home / "Documents" / "xwechat_files" / "__runtime_unresolved__"
     runtime: dict[str, Any] = {
-        "runtime_bridge": "wechat-selkies-v1",
-        "display": display,
+        "runtime_bridge": "agent-wechat-v1" if provider == "agent_wechat" else "wechat-selkies-v1",
+        "runtime_provider": provider,
+        "display": "isolated" if provider == "agent_wechat" else display,
         "uid": item.get("uid"),
         "legacy": bool(item.get("legacy", False)),
         "enabled": bool(item.get("enabled", True)),
         "sender_enabled": bool(item.get("enabled", True)),
         "source_home": str(home),
-        "display_lock": _display_lock_path(display),
-        "xauthority": str(config_root / ".Xauthority"),
     }
+    if provider == "agent_wechat":
+        agent_wechat = item.get("agent_wechat") if isinstance(item.get("agent_wechat"), dict) else {}
+        container_name = _text(agent_wechat.get("container_name"), "agent_wechat.container_name", required=True)
+        token_file = _text(agent_wechat.get("token_file"), "agent_wechat.token_file", required=True)
+        runtime.update(
+            {
+                "sender_driver": "agent_wechat",
+                "agent_wechat_container": container_name,
+                "agent_wechat_base_url": f"http://{container_name}:6174",
+                "agent_wechat_token_file": str(_translate_runtime_home(token_file, config_root=config_root)),
+                "agent_wechat_image": _text(agent_wechat.get("image"), "agent_wechat.image"),
+                "runtime_status_file": f"/run/wechat-runtime/accounts/{account_id}/agent-status.json",
+                "native_driver_enabled": False,
+            }
+        )
+    else:
+        runtime.update(
+            {
+                "sender_driver": "legacy",
+                "display_lock": _display_lock_path(display),
+                "xauthority": str(config_root / ".Xauthority"),
+                "native_driver_enabled": False,
+            }
+        )
     return parse_account(
         {
             "account_id": account_id,

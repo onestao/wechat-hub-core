@@ -87,34 +87,47 @@ def detect_xor_key(data: bytes) -> int | None:
     return None
 
 
-def decrypt_v2(data: bytes, aes_key: str | bytes | None, xor_key: int) -> tuple[bytes | None, str | None]:
+def decrypt_v2_head(data: bytes, aes_key: str | bytes | None) -> tuple[bytes, int, int] | None:
+    """AES-decrypt the head chunk of a V1/V2 ``.dat``.
+
+    Returns ``(plain_head, body_offset, xor_size)``.  The head is independent
+    of the trailing XOR byte, so it is decrypted once and then reassembled
+    against candidate XOR bytes.
+    """
+
     if len(data) < 15:
-        return None, None
+        return None
     sig = data[:6]
     if sig not in (V2_MAGIC_FULL, V1_MAGIC_FULL):
-        return None, None
+        return None
     if sig == V1_MAGIC_FULL:
         key = b"cfcd208495d565ef"
     elif aes_key:
         key = aes_key.encode("ascii")[:16] if isinstance(aes_key, str) else aes_key[:16]
     else:
-        return None, None
+        return None
     if len(key) < 16:
-        return None, None
+        return None
 
     aes_size, xor_size = struct.unpack_from("<LL", data, 6)
     aligned_size = aligned_aes_block_size(aes_size)
     offset = 15
     if offset + aligned_size > len(data):
-        return None, None
+        return None
     try:
         cipher = AES.new(key, AES.MODE_ECB)
         dec_aes = Padding.unpad(cipher.decrypt(data[offset : offset + aligned_size]), AES.block_size)
     except (ValueError, KeyError):
-        return None, None
-    offset += aligned_size
+        return None
+    return dec_aes, offset + aligned_size, xor_size
+
+
+def assemble_v2(data: bytes, head: tuple[bytes, int, int], xor_key: int) -> tuple[bytes | None, str | None]:
+    """Reassemble a V1/V2 ``.dat`` with ``xor_key`` applied to its tail region."""
+
+    dec_aes, body_offset, xor_size = head
     raw_end = len(data) - xor_size
-    raw_data = data[offset:raw_end] if offset < raw_end else b""
+    raw_data = data[body_offset:raw_end] if body_offset < raw_end else b""
     dec_xor = bytes(b ^ xor_key for b in data[raw_end:])
     decrypted = dec_aes + raw_data + dec_xor
     fmt = detect_image_format(decrypted[:16])
@@ -125,6 +138,51 @@ def decrypt_v2(data: bytes, aes_key: str | bytes | None, xor_key: int) -> tuple[
     if fmt == "png" and b"IEND" not in decrypted[-12:]:
         return None, None
     return decrypted, fmt
+
+
+def derive_xor_byte(data: bytes, plain_head: bytes, xor_size: int) -> int | None:
+    """Recover the per-account XOR byte from known image plaintext at the tail.
+
+    The XOR byte is account-specific and is not stored by upstream's key
+    extractor, so the configured default can be wrong.  Only formats with a
+    deterministic trailing signature are used; a blind 0..255 scan is
+    deliberately avoided because the image magic lives in the AES region and
+    would validate for every candidate byte.
+    """
+
+    if xor_size < 2 or len(data) < 2:
+        return None
+    if plain_head[:2] == b"\xff\xd8":
+        # JPEG ends with FF D9.
+        c1 = data[-2] ^ 0xFF
+        c2 = data[-1] ^ 0xD9
+        return c1 if c1 == c2 else None
+    if plain_head[:4] == b"GIF8":
+        # GIF ends with 00 3B.
+        c1 = data[-2] ^ 0x00
+        c2 = data[-1] ^ 0x3B
+        return c1 if c1 == c2 else None
+    if plain_head[:4] == b"\x89PNG" and xor_size >= 8 and len(data) >= 8:
+        # PNG ends with the IEND chunk plus its CRC.
+        expected = b"\x49\x45\x4e\x44\xae\x42\x60\x82"
+        tail = data[-8:]
+        candidate = tail[0] ^ expected[0]
+        if all((tail[i] ^ candidate) == expected[i] for i in range(1, 8)):
+            return candidate
+    return None
+
+
+def decrypt_v2(data: bytes, aes_key: str | bytes | None, xor_key: int) -> tuple[bytes | None, str | None]:
+    head = decrypt_v2_head(data, aes_key)
+    if head is None:
+        return None, None
+    decrypted, fmt = assemble_v2(data, head, xor_key)
+    if decrypted:
+        return decrypted, fmt
+    derived = derive_xor_byte(data, head[0], head[2])
+    if derived is None or derived == xor_key:
+        return None, None
+    return assemble_v2(data, head, derived)
 
 
 def decrypt_dat(dat_path: Path, aes_key: str | bytes | None, xor_key: int) -> tuple[bytes | None, str | None]:

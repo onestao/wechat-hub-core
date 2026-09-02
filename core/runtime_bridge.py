@@ -8,6 +8,7 @@ identifiers when sync, key scanning, or sending needs them.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -150,11 +151,57 @@ def discover_source_db(home: Path) -> tuple[Path, Path] | None:
     return source_db, source_db.parent
 
 
+def _agent_runtime_status(account: AccountConfig) -> dict[str, Any]:
+    status_file = str(account.runtime.get("runtime_status_file") or "").strip()
+    if not status_file:
+        return {}
+    try:
+        value = json.loads(Path(status_file).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def resolve_runtime_account(account: AccountConfig) -> AccountConfig:
     """Refresh PID/window/source paths for an account derived from package A."""
     if not account.runtime.get("runtime_bridge"):
         return account
     runtime: dict[str, Any] = dict(account.runtime)
+
+    if account.runtime_provider == "agent_wechat":
+        status = _agent_runtime_status(account)
+        container_id = str(status.get("container_id") or "").strip()
+        runtime["container_id"] = container_id
+        # AgentWechat containers intentionally keep isolated PID namespaces so
+        # each upstream instance can only discover its own WeChat process.
+        # Core imports stored DB credentials from that account's agent.db
+        # instead of ptracing the child process.
+        runtime["pids"] = []
+        runtime["running"] = bool(status.get("running"))
+        for key in (
+            "container_running",
+            "agent_server_healthy",
+            "runtime_health",
+            "health_error",
+            "wechat_login_status",
+            "logged_in_user",
+        ):
+            if key in status:
+                runtime[key] = status[key]
+        source_db_dir = account.source_db_dir
+        wechat_base_dir = account.wechat_base_dir
+        source_home = str(runtime.get("source_home") or "").strip()
+        if source_home:
+            discovered = discover_source_db(Path(source_home))
+            if discovered:
+                source_db_dir, wechat_base_dir = discovered
+        return replace(
+            account,
+            source_db_dir=source_db_dir,
+            wechat_base_dir=wechat_base_dir,
+            runtime=runtime,
+        )
+
     uid_raw = runtime.get("uid")
     try:
         uid = int(uid_raw)
