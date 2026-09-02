@@ -1,5 +1,12 @@
 FROM python:3.12-slim
 
+ARG OCI_REVISION=""
+ARG OCI_VERSION=""
+
+LABEL org.opencontainers.image.source="https://github.com/onestao/wechat-hub-core"
+LABEL org.opencontainers.image.revision="${OCI_REVISION}"
+LABEL org.opencontainers.image.version="${OCI_VERSION}"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
