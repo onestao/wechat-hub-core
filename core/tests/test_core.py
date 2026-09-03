@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import os
+import tempfile
 import json
 import shutil
 import sqlite3
@@ -19,6 +21,9 @@ from unittest.mock import patch
 
 CORE_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(CORE_ROOT))
+
+_TEST_GUI_LEASE_DIR = tempfile.TemporaryDirectory()
+os.environ.setdefault('WECHAT_GUI_LEASE_DIR', _TEST_GUI_LEASE_DIR.name)
 
 from core.app import CoreService, RegistryReloadLoop, create_server  # noqa: E402
 from core.account_worker import media_args  # noqa: E402
