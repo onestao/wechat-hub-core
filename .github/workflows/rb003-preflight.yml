@@ -1,0 +1,101 @@
+name: RB003 Core Artifact Preflight (temporary)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'preflight = tag-absence check; verify = published artifact provenance check'
+        required: true
+        default: 'preflight'
+      check_tag:
+        description: 'Core image tag to check (e.g. 0.1.0-rc.5-rb003)'
+        required: true
+      expected_digest:
+        description: 'verify mode: expected sha256:<hex> digest for the tag'
+        required: false
+      expected_revision:
+        description: 'verify mode: expected org.opencontainers.image.revision label'
+        required: false
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  preflight:
+    if: ${{ inputs.mode == 'preflight' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail-closed tag-absence check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: onestao/wechat-hub-core
+          TAG: ${{ inputs.check_tag }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(curl -sf -u "x-access-token:${GH_TOKEN}" "https://ghcr.io/token?scope=repository:${IMAGE}:pull" | jq -r .token)
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" "https://ghcr.io/v2/${IMAGE}/manifests/${TAG}")
+          echo "registry HTTP status for ${IMAGE}:${TAG} = ${CODE}"
+          case "${CODE}" in
+            404)
+              echo "TAG_UNUSED: ${IMAGE}:${TAG}"
+              ;;
+            200)
+              echo "TAG_EXISTS: ${IMAGE}:${TAG} — refusing to overwrite (fail closed)"
+              exit 1
+              ;;
+            *)
+              echo "INDETERMINATE: HTTP ${CODE} — treating as existing (fail closed)"
+              exit 1
+              ;;
+          esac
+
+  verify:
+    if: ${{ inputs.mode == 'verify' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify published tag digest + OCI revision labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: onestao/wechat-hub-core
+          TAG: ${{ inputs.check_tag }}
+          EXPECTED_DIGEST: ${{ inputs.expected_digest }}
+          EXPECTED_REVISION: ${{ inputs.expected_revision }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(curl -sf -u "x-access-token:${GH_TOKEN}" "https://ghcr.io/token?scope=repository:${IMAGE}:pull" | jq -r .token)
+          AUTH="Authorization: Bearer ${TOKEN}"
+          ACCEPT="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+
+          HEADERS=$(mktemp); BODY=$(mktemp)
+          CODE=$(curl -s -o "${BODY}" -D "${HEADERS}" -w '%{http_code}' -H "${AUTH}" -H "Accept: ${ACCEPT}" "https://ghcr.io/v2/${IMAGE}/manifests/${TAG}")
+          echo "manifest fetch HTTP ${CODE}"
+          [ "${CODE}" = "200" ] || { echo "VERIFY_FAIL: tag not fetchable"; exit 1; }
+          DIGEST=$(grep -i '^docker-content-digest:' "${HEADERS}" | tr -d '\r' | awk '{print $2}')
+          echo "tag digest: ${DIGEST}"
+
+          MTYPE=$(jq -r '.mediaType' "${BODY}")
+          if [ "${MTYPE}" = "application/vnd.oci.image.index.v1+json" ] || [ "${MTYPE}" = "application/vnd.docker.distribution.manifest.list.v2+json" ]; then
+            AMD64=$(jq -r '.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest' "${BODY}" | head -1)
+            echo "amd64 manifest: ${AMD64}"
+            CODE=$(curl -s -o "${BODY}" -D /dev/null -w '%{http_code}' -H "${AUTH}" -H "Accept: ${ACCEPT}" "https://ghcr.io/v2/${IMAGE}/manifests/${AMD64}")
+            [ "${CODE}" = "200" ] || { echo "VERIFY_FAIL: amd64 manifest not fetchable"; exit 1; }
+          fi
+          CONFIG=$(jq -r '.config.digest' "${BODY}")
+          curl -s -H "${AUTH}" "https://ghcr.io/v2/${IMAGE}/blobs/${CONFIG}" > config.json
+          REVISION=$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' config.json)
+          VERSION=$(jq -r '.config.Labels["org.opencontainers.image.version"] // ""' config.json)
+          echo "OCI revision label: ${REVISION}"
+          echo "OCI version label:  ${VERSION}"
+
+          FAIL=0
+          if [ -n "${EXPECTED_DIGEST}" ] && [ "${DIGEST}" != "${EXPECTED_DIGEST}" ]; then
+            echo "VERIFY_FAIL: digest mismatch (tag=${DIGEST} expected=${EXPECTED_DIGEST})"; FAIL=1
+          fi
+          if [ -n "${EXPECTED_REVISION}" ] && [ "${REVISION}" != "${EXPECTED_REVISION}" ]; then
+            echo "VERIFY_FAIL: revision label mismatch (label=${REVISION} expected=${EXPECTED_REVISION})"; FAIL=1
+          fi
+          if [ "${FAIL}" = "0" ]; then
+            echo "VERIFY_OK: ${IMAGE}:${TAG} digest=${DIGEST} revision=${REVISION} version=${VERSION}"
+          fi
+          exit ${FAIL}
