@@ -16,7 +16,7 @@ from .normalize import import_account
 from .registry import AccountConfig, AccountRegistry
 from .runtime_bridge import resolve_runtime_account
 from .source_provenance import SourceIdentityError, valid_wxid, wechat_data_dir_name
-from .store import CoreStore
+from .store import CoreStore, parse_rfc3339
 
 
 def now_iso() -> str:
@@ -28,6 +28,57 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+DEFAULT_FRESHNESS_SLO_MULTIPLIER = 6.0
+DEFAULT_MIN_FRESHNESS_SLO_SECONDS = 60.0
+
+
+def evaluate_account_freshness(
+    account_data: dict[str, Any],
+    *,
+    sync_interval: float = 0.0,
+    slo_multiplier: float = DEFAULT_FRESHNESS_SLO_MULTIPLIER,
+    min_slo_seconds: float = DEFAULT_MIN_FRESHNESS_SLO_SECONDS,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Inspect account sync status against projection-freshness SLO without mutating on-disk state."""
+    sync = account_data.get("sync")
+    if not isinstance(sync, dict) or not sync:
+        return account_data
+
+    if sync.get("ok") is False:
+        if account_data.get("state") == "online":
+            account_data["state"] = "degraded"
+
+    if sync_interval <= 0:
+        return account_data
+
+    finished_at_str = sync.get("finished_at")
+    if not finished_at_str:
+        return account_data
+
+    finished_at = parse_rfc3339(finished_at_str)
+    if not finished_at:
+        return account_data
+
+    current_time = now or datetime.now(timezone.utc)
+    age_seconds = max(0.0, (current_time - finished_at).total_seconds())
+    slo_seconds = max(min_slo_seconds, float(sync_interval) * slo_multiplier)
+
+    sync["staleness_seconds"] = round(age_seconds, 1)
+    sync["slo_seconds"] = round(slo_seconds, 1)
+    if age_seconds > slo_seconds:
+        sync["stale"] = True
+        if isinstance(sync.get("freshness"), dict):
+            sync["freshness"]["status"] = "stale"
+            sync["freshness"]["staleness_seconds"] = round(age_seconds, 1)
+            sync["freshness"]["slo_seconds"] = round(slo_seconds, 1)
+        if account_data.get("state") == "online":
+            account_data["state"] = "degraded"
+    else:
+        sync["stale"] = False
+
+    return account_data
 
 
 class SyncLiveness:
@@ -209,18 +260,62 @@ class AccountWorker:
                 ingest = ingest_memory(account.decrypted_dir, account.memory_db)
             media = sync_media(media_args(account))
             normalized = import_account(account, self.store)
+            has_failed_shards = bool(refresh.get("failed"))
+            missing_key_shards = list(refresh.get("missing_key") or [])
+            is_complete = not missing_key_shards
+            sync_ok = (not has_failed_shards) and is_complete
+
+            freshness = {
+                "status": "healthy" if sync_ok else "degraded",
+                "completeness": "complete" if is_complete else "incomplete",
+                "source": {
+                    "source_db_dir": str(account.source_db_dir),
+                    "total_shards": len(refresh.get("updated", []))
+                    + len(refresh.get("skipped", []))
+                    + len(missing_key_shards)
+                    + len(refresh.get("failed", [])),
+                },
+                "decrypt": {
+                    "finished_at": now_iso(),
+                    "updated_count": len(refresh.get("updated", [])),
+                    "skipped_count": len(refresh.get("skipped", [])),
+                    "missing_key_count": len(missing_key_shards),
+                    "failed_count": len(refresh.get("failed", [])),
+                    "missing_keys": missing_key_shards,
+                },
+                "staging": {
+                    "memory_db": str(account.memory_db),
+                    "chats": ingest.get("chats", 0) if isinstance(ingest, dict) else 0,
+                    "messages": ingest.get("messages", 0) if isinstance(ingest, dict) else 0,
+                    "changed_rows": ingest.get("changed_rows", 0) if isinstance(ingest, dict) else 0,
+                },
+                "core": {
+                    "projected_at": now_iso(),
+                    "chats": normalized.get("chats", 0) if isinstance(normalized, dict) else 0,
+                    "messages": normalized.get("messages", 0) if isinstance(normalized, dict) else 0,
+                    "message_changes": normalized.get("message_changes", 0) if isinstance(normalized, dict) else 0,
+                },
+            }
             status.update(
                 {
-                    "ok": not refresh["failed"],
+                    "ok": sync_ok,
+                    "completeness": "complete" if is_complete else "incomplete",
                     "key_extract": key_extract,
                     "refresh": refresh,
                     "repair": repair,
                     "ingest": ingest,
                     "media": media,
                     "normalized": normalized,
+                    "freshness": freshness,
                 }
             )
-            state = "online" if status["ok"] else "degraded"
+            state = "online" if sync_ok else "degraded"
+            if missing_key_shards:
+                status["missing_key_shards"] = missing_key_shards
+                status["degraded_reason"] = f"missing decryption key for: {', '.join(missing_key_shards)}"
+            elif has_failed_shards:
+                failed_names = [item.get("db", "unknown") for item in refresh.get("failed", []) if isinstance(item, dict)]
+                status["degraded_reason"] = f"decrypt failed for: {', '.join(failed_names)}"
             if (
                 account.runtime_provider == "agent_wechat"
                 and account.runtime.get("agent_server_healthy") is False
@@ -235,6 +330,13 @@ class AccountWorker:
             state = "error"
         except Exception as exc:  # Sync failures are account-scoped and must not stop peer accounts.
             status["error"] = str(exc)
+            status["ok"] = False
+            status["completeness"] = "unknown"
+            status["freshness"] = {
+                "status": "error",
+                "completeness": "unknown",
+                "error": str(exc),
+            }
             state = "error"
         status["finished_at"] = now_iso()
         status["elapsed_seconds"] = round(time.monotonic() - started, 3)
@@ -294,6 +396,13 @@ class AccountSyncLoop:
         self.liveness = SyncLiveness(self.interval_seconds, path=liveness_path)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="wechat-core-sync", daemon=True)
+        self.last_run_at: str | None = None
+        self.last_run_ok: bool = True
+        self.last_error: str = ""
+        self.consecutive_failures: int = 0
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
 
     def start(self) -> None:
         self._thread.start()
@@ -332,9 +441,27 @@ class AccountSyncLoop:
                 self.liveness.record_cycle_error(exc)
                 traceback.print_exc()
                 self.liveness.flush()
+                self.last_run_at = now_iso()
+                self.last_run_ok = False
+                self.consecutive_failures += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"
                 self._stop.wait(self._failure_delay())
                 continue
             account_errors = self._cycle_account_errors(result)
             self.liveness.record_cycle_completed(clean=not account_errors, account_errors=account_errors)
             self.liveness.flush()
+            cycle_ok = bool(result.get("ok"))
+            self.last_run_at = now_iso()
+            self.last_run_ok = cycle_ok
+            if cycle_ok:
+                self.consecutive_failures = 0
+                self.last_error = ""
+            else:
+                # Account-level degradation is normal operation: the loop keeps
+                # the regular cadence, but the failure streak stays observable.
+                self.consecutive_failures += 1
+                self.last_error = (
+                    "; ".join(f"{account_id}: {message}" for account_id, message in account_errors.items())
+                    or "sync cycle reported failures"
+                )
             self._stop.wait(self.interval_seconds)

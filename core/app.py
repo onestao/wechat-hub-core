@@ -18,11 +18,19 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import CONTRACT_VERSION
-from .account_worker import AccountSyncLoop, AccountWorker
+from datetime import datetime, timezone
+
+from .account_worker import (
+    DEFAULT_FRESHNESS_SLO_MULTIPLIER,
+    DEFAULT_MIN_FRESHNESS_SLO_SECONDS,
+    AccountSyncLoop,
+    AccountWorker,
+    evaluate_account_freshness,
+)
 from .registry import AccountRegistry, RegistryError, legacy_registry, load_registry
 from .runtime_control import RuntimeControlClient, RuntimeControlError
 from .sender import AccountSender, OutboxLoop, sender_capabilities
-from .store import CoreStore, StoreError, stable_event_value, utc_now
+from .store import CoreStore, StoreError, parse_rfc3339, stable_event_value, utc_now
 
 
 ACCOUNT_STATES = {"offline", "starting", "login_required", "online", "degraded", "stopped", "error"}
@@ -64,11 +72,15 @@ class CoreService:
         registry: AccountRegistry,
         store: CoreStore,
         runtime_control: RuntimeControlClient | None = None,
+        sync_loop: AccountSyncLoop | None = None,
+        sync_interval: float = 0.0,
     ) -> None:
         self.root = root
         self.registry = registry
         self.store = store
         self.runtime_control = runtime_control
+        self.sync_loop = sync_loop
+        self.sync_interval = max(0.0, float(sync_interval))
         self.media_root = root / "runtime" / "core-media"
         self._registry_reload_lock = threading.RLock()
         self._registry_fingerprint_value = ""
@@ -136,7 +148,11 @@ class CoreService:
         for config in self.registry.all():
             account = self.store.account(config.account_id)
             if account is not None:
-                output.append(account)
+                evaluated = evaluate_account_freshness(
+                    account,
+                    sync_interval=self.sync_interval,
+                )
+                output.append(evaluated)
         return sorted(output, key=lambda item: str(item.get("account_id") or ""))
 
     def _registry_fingerprint(self) -> str:
@@ -221,6 +237,53 @@ class CoreService:
             "registry_hot_reload": True,
         }
 
+    def sync_health(self) -> dict[str, Any]:
+        loop = self.sync_loop
+        enabled = self.sync_interval > 0 or loop is not None
+        if not enabled:
+            return {"enabled": False, "ok": True}
+
+        worker_alive = loop.is_alive() if loop is not None else False
+        consecutive_failures = loop.consecutive_failures if loop is not None else 0
+        last_run_at = loop.last_run_at if loop is not None else None
+        last_error = loop.last_error if loop is not None else ""
+
+        slo_seconds = max(DEFAULT_MIN_FRESHNESS_SLO_SECONDS, float(self.sync_interval) * DEFAULT_FRESHNESS_SLO_MULTIPLIER)
+        stale_accounts: list[str] = []
+        degraded_accounts: list[str] = []
+        now = datetime.now(timezone.utc)
+
+        for config in self.registry.all():
+            acct = self.store.account(config.account_id)
+            if not acct:
+                continue
+            sync = acct.get("sync") or {}
+            if sync.get("ok") is False:
+                degraded_accounts.append(config.account_id)
+            finished_at_str = sync.get("finished_at")
+            if finished_at_str:
+                finished_at = parse_rfc3339(finished_at_str)
+                if finished_at and (now - finished_at).total_seconds() > slo_seconds:
+                    stale_accounts.append(config.account_id)
+            elif sync and sync.get("started_at"):
+                started_at = parse_rfc3339(sync.get("started_at", ""))
+                if started_at and (now - started_at).total_seconds() > slo_seconds:
+                    stale_accounts.append(config.account_id)
+
+        is_healthy = worker_alive and (not stale_accounts) and (not degraded_accounts)
+        return {
+            "enabled": True,
+            "ok": is_healthy,
+            "worker_alive": worker_alive,
+            "interval_seconds": self.sync_interval,
+            "slo_seconds": slo_seconds,
+            "consecutive_failures": consecutive_failures,
+            "last_run_at": last_run_at,
+            "last_error": last_error,
+            "stale_accounts": stale_accounts,
+            "degraded_accounts": degraded_accounts,
+        }
+
     @staticmethod
     def _runtime_error(error: RuntimeControlError) -> ApiError:
         status = {
@@ -295,7 +358,11 @@ class CoreService:
         elif str(runtime.get("runtime_provider") or config.runtime_provider) == "agent_wechat" and status.get("agent_server_healthy") is True:
             login_status = str(status.get("wechat_login_status") or "unknown")
             if login_status == "logged_in":
-                state = "online"
+                existing_sync = (existing or {}).get("sync") or {}
+                if existing_sync.get("ok") is False or (existing or {}).get("state") == "degraded":
+                    state = "degraded"
+                else:
+                    state = "online"
             elif login_status == "logged_out":
                 state = "login_required"
             else:
@@ -578,6 +645,7 @@ class CoreHandler(BaseHTTPRequestHandler):
                         "registry": self.service.registry_status(),
                         "runtime_management": self.service.runtime_management_status(),
                         **self.service.sync_worker_liveness_snapshot(),
+                        "sync": self.service.sync_health(),
                     },
                 )
                 return
@@ -834,6 +902,7 @@ def main(argv: list[str] | None = None) -> int:
         registry=registry,
         store=CoreStore(database),
         runtime_control=runtime_control,
+        sync_interval=args.sync_interval,
     )
     sync_loop = None
     sender_loop = None
@@ -847,6 +916,7 @@ def main(argv: list[str] | None = None) -> int:
             args.sync_interval,
             liveness_path=database.parent / "sync_liveness.json",
         )
+        service.sync_loop = sync_loop
         sync_loop.start()
         service.sync_worker_liveness = sync_loop.liveness
     if args.send_interval > 0:
