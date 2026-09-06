@@ -14,7 +14,7 @@ from typing import Any
 from memory.message_parse import message_display_parts
 
 from .registry import AccountConfig
-from .store import CoreStore, utc_now
+from .store import CoreStore, utc_now, resolve_contact_display_name, resolve_group_member_display_name
 
 
 TYPE_MAP = {
@@ -111,7 +111,7 @@ def decode_chatroom_members_buffer(buffer: bytes | None) -> dict[str, str]:
     return members
 
 
-def _load_contacts(contact_db: Path) -> dict[str, dict[str, str]]:
+def _load_contacts(contact_db: Path) -> dict[str, dict[str, Any]]:
     if not contact_db.exists():
         return {}
     try:
@@ -119,22 +119,47 @@ def _load_contacts(contact_db: Path) -> dict[str, dict[str, str]]:
             conn.row_factory = sqlite3.Row
             if not _table(conn, "contact"):
                 return {}
-            rows = conn.execute("SELECT username, remark, nick_name, alias FROM contact").fetchall()
+            cols = _columns(conn, "contact")
+            select_cols = ["username", "remark", "nick_name", "alias"]
+            for opt in ("big_head_url", "small_head_url", "head_img_md5"):
+                if opt in cols:
+                    select_cols.append(opt)
+            rows = conn.execute(f"SELECT {', '.join(select_cols)} FROM contact WHERE COALESCE(username, '')!=''").fetchall()
     except sqlite3.Error:
         return {}
-    return {
-        str(row["username"]): {
-            "member_id": str(row["username"]),
-            "display_name": _safe_text(row["remark"] or row["nick_name"] or row["alias"] or row["username"]),
-            "alias": _safe_text(row["alias"], 80),
-            "remark": _safe_text(row["remark"], 80),
+    contacts: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        member_id = str(row["username"] or "").strip()
+        if not member_id:
+            continue
+        remark = _safe_text(row["remark"], 80)
+        nickname = _safe_text(row["nick_name"], 80)
+        alias = _safe_text(row["alias"], 80)
+        big_head = str(_value(row, "big_head_url", ""))
+        small_head = str(_value(row, "small_head_url", ""))
+        head_img_md5 = str(_value(row, "head_img_md5", ""))
+        avatar_ref = small_head or big_head or f"/api/avatar/{member_id}"
+        display_name = resolve_contact_display_name(remark=remark, nickname=nickname, alias=alias, member_id=member_id)
+        contacts[member_id] = {
+            "member_id": member_id,
+            "display_name": display_name,
+            "remark": remark,
+            "nickname": nickname,
+            "alias": alias,
+            "big_head_url": big_head,
+            "small_head_url": small_head,
+            "head_img_md5": head_img_md5,
+            "avatar_ref": avatar_ref,
         }
-        for row in rows
-        if row["username"]
-    }
+    return contacts
 
 
-def _load_group_members(contact_db: Path, chat_id: str, contacts: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
+def _load_group_members(
+    contact_db: Path,
+    chat_id: str,
+    contacts: dict[str, dict[str, Any]],
+    self_wxid: str = "",
+) -> list[dict[str, Any]]:
     if not contact_db.exists():
         return []
     aliases: dict[str, str] = {}
@@ -161,25 +186,62 @@ def _load_group_members(contact_db: Path, chat_id: str, contacts: dict[str, dict
         return []
     members: dict[str, dict[str, Any]] = {}
     for row in rows:
-        member_id = str(row["username"] or "")
-        if member_id:
-            members[member_id] = {
-                "member_id": member_id,
-                "display_name": _safe_text(aliases.get(member_id) or row["remark"] or row["nick_name"] or row["alias"] or member_id),
-                "alias": _safe_text(row["alias"], 80),
-                "is_self": False,
-            }
-    for member_id, group_alias in aliases.items():
+        member_id = str(row["username"] or "").strip()
+        if not member_id:
+            continue
         contact = contacts.get(member_id, {})
-        members.setdefault(
-            member_id,
-            {
-                "member_id": member_id,
-                "display_name": _safe_text(group_alias or contact.get("display_name") or member_id),
-                "alias": _safe_text(contact.get("alias"), 80),
-                "is_self": False,
-            },
+        group_nickname = _safe_text(aliases.get(member_id, ""), 80)
+        remark = contact.get("remark") or _safe_text(row["remark"], 80)
+        nickname = contact.get("nickname") or _safe_text(row["nick_name"], 80)
+        alias = contact.get("alias") or _safe_text(row["alias"], 80)
+        avatar_ref = contact.get("avatar_ref") or f"/api/avatar/{member_id}"
+        is_self = bool(member_id == self_wxid or member_id == "self")
+        display_name = resolve_group_member_display_name(
+            group_nickname=group_nickname,
+            remark=remark,
+            nickname=nickname,
+            alias=alias,
+            member_id=member_id,
         )
+        members[member_id] = {
+            "chat_id": chat_id,
+            "member_id": member_id,
+            "group_nickname": group_nickname,
+            "display_name": display_name,
+            "remark": remark,
+            "nickname": nickname,
+            "alias": alias,
+            "avatar_ref": avatar_ref,
+            "is_self": is_self,
+        }
+    for member_id, group_alias in aliases.items():
+        if member_id in members:
+            continue
+        contact = contacts.get(member_id, {})
+        group_nickname = _safe_text(group_alias, 80)
+        remark = contact.get("remark", "")
+        nickname = contact.get("nickname", "")
+        alias = contact.get("alias", "")
+        avatar_ref = contact.get("avatar_ref") or f"/api/avatar/{member_id}"
+        is_self = bool(member_id == self_wxid or member_id == "self")
+        display_name = resolve_group_member_display_name(
+            group_nickname=group_nickname,
+            remark=remark,
+            nickname=nickname,
+            alias=alias,
+            member_id=member_id,
+        )
+        members[member_id] = {
+            "chat_id": chat_id,
+            "member_id": member_id,
+            "group_nickname": group_nickname,
+            "display_name": display_name,
+            "remark": remark,
+            "nickname": nickname,
+            "alias": alias,
+            "avatar_ref": avatar_ref,
+            "is_self": is_self,
+        }
     return list(members.values())
 
 
@@ -290,6 +352,45 @@ def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
     for contact in contacts.values():
         store.upsert_contact(account.account_id, contact)
         summary["contacts"] += 1
+
+    # E3: Resolve self profile
+    self_wxid = ""
+    try:
+        binding = store.binding_state(account.account_id)
+        identity_uuid = str((binding.get("identity") or {}).get("wechat_identity_uuid") or "")
+        wechat_user_id = str((binding.get("identity") or {}).get("wechat_user_id") or account.runtime.get("logged_in_user") or "")
+        if identity_uuid and wechat_user_id:
+            self_wxid = wechat_user_id
+            self_contact = contacts.get(wechat_user_id)
+            self_nickname = ""
+            self_avatar = ""
+            if self_contact:
+                self_nickname = self_contact.get("nickname") or self_contact.get("remark") or self_contact.get("alias") or ""
+                self_avatar = self_contact.get("avatar_ref") or ""
+            if not self_avatar:
+                head_img_db = account.decrypted_dir / "head_image" / "head_image.db"
+                if head_img_db.exists():
+                    try:
+                        with sqlite_connection(head_img_db) as hconn:
+                            if _table(hconn, "head_image"):
+                                hrow = hconn.execute(
+                                    "SELECT 1 FROM head_image WHERE username=? AND length(image_buffer)>0",
+                                    (wechat_user_id,),
+                                ).fetchone()
+                                if hrow:
+                                    self_avatar = f"/v1/identities/{identity_uuid}/avatar"
+                    except Exception:
+                        pass
+            if not self_nickname:
+                # E3: 不猜，fallback 到 wxid
+                self_nickname = wechat_user_id
+            store.update_identity_profile(
+                identity_uuid,
+                nickname=self_nickname,
+                avatar_ref=self_avatar,
+            )
+    except Exception:
+        pass
     with sqlite_connection(account.memory_db) as conn:
         conn.row_factory = sqlite3.Row
         if not _table(conn, "chats") or not _table(conn, "messages"):
@@ -307,7 +408,7 @@ def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
                 "vendor_specific": {"source_message_table": _value(row, "message_table", "")},
             }
             if type_name == "group":
-                members = _load_group_members(contact_db, chat_id, contacts)
+                members = _load_group_members(contact_db, chat_id, contacts, self_wxid=self_wxid)
                 normalized_chat["member_count"] = len(members)
                 store.upsert_chat(normalized_chat)
                 for member in members:

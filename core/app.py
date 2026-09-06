@@ -25,6 +25,8 @@ from .registry import AccountRegistry, RegistryError, legacy_registry, load_regi
 from .runtime_control import RuntimeControlClient, RuntimeControlError
 from .sender import AccountSender, OutboxLoop, sender_capabilities
 from .store import CoreStore, StoreError, utc_now
+import sqlite3
+from .avatar import AvatarSecurityError, detect_image_mime, fetch_remote_avatar, fallback_avatar_svg
 
 
 ACCOUNT_STATES = {"offline", "starting", "login_required", "online", "degraded", "stopped", "error"}
@@ -571,6 +573,80 @@ class CoreService:
             raise ApiError(502, "invalid_runtime_response", "Runtime login snapshot exceeds the safe response limit")
         return content, str(result.get("content_type") or "image/png")
 
+    def resolve_avatar(
+        self,
+        avatar_key: str,
+        *,
+        wechat_identity_uuid: str = "",
+        member_id: str = "",
+    ) -> tuple[bytes, str]:
+        """Resolve avatar bytes and MIME type with security checks and multi-tier caching."""
+        key = str(avatar_key or "").strip()
+        target_username = member_id or key
+        cache_key = f"{wechat_identity_uuid}:{target_username}" if wechat_identity_uuid else f"key:{key}"
+
+        # 1. Check avatar_cache in CoreStore
+        cached = self.store.get_avatar_cache(cache_key)
+        if cached:
+            return cached
+
+        # 2. If target is identity UUID, resolve wechat_user_id
+        if not member_id and identity_v2.INSTANCE_UUID_RE.match(key):
+            identity_record = self.store.wechat_identity(key)
+            if identity_record and identity_record.get("wechat_user_id"):
+                target_username = str(identity_record["wechat_user_id"])
+                cached = self.store.get_avatar_cache(f"key:{target_username}")
+                if cached:
+                    return cached
+
+        # 3. Check head_image.db across registered accounts
+        for account in list(self.registry.accounts.values()):
+            head_img_db = account.decrypted_dir / "head_image" / "head_image.db"
+            if head_img_db.exists():
+                try:
+                    conn = sqlite3.connect(f"file:{head_img_db}?mode=ro", uri=True)
+                    try:
+                        row = conn.execute(
+                            "SELECT image_buffer FROM head_image WHERE username=? AND length(image_buffer)>0",
+                            (target_username,),
+                        ).fetchone()
+                        if row and row[0]:
+                            body = bytes(row[0])
+                            mime = detect_image_mime(body) or "image/jpeg"
+                            self.store.set_avatar_cache(cache_key, body, mime)
+                            return body, mime
+                    finally:
+                        conn.close()
+                except Exception:
+                    pass
+
+        # 4. Check contact in store for remote URLs (small_head_url, big_head_url, avatar_ref)
+        remote_url = ""
+        if wechat_identity_uuid and target_username:
+            contact = self.store.identity_contact(wechat_identity_uuid, target_username)
+            if contact:
+                candidate = contact.get("small_head_url") or contact.get("big_head_url") or contact.get("avatar_ref") or ""
+                if candidate.startswith(("http://", "https://")):
+                    remote_url = candidate
+
+        if not remote_url and wechat_identity_uuid:
+            identity_record = self.store.wechat_identity(wechat_identity_uuid)
+            if identity_record:
+                candidate = str(identity_record.get("avatar_ref") or "")
+                if candidate.startswith(("http://", "https://")):
+                    remote_url = candidate
+
+        # 5. Secure fetch if verified WeChat remote URL is found
+        if remote_url:
+            try:
+                body, mime = fetch_remote_avatar(remote_url)
+                self.store.set_avatar_cache(cache_key, body, mime)
+                return body, mime
+            except AvatarSecurityError as exc:
+                raise ApiError(exc.status, exc.code, exc.message, exc.details) from exc
+
+        raise ApiError(404, "avatar_not_found", f"Avatar not found for {avatar_key}")
+
     def runtime_desktop(self, account_id: str) -> dict[str, Any]:
         self.require_account(account_id)
         result = self._runtime_request("desktop", account_id=account_id)
@@ -857,6 +933,15 @@ class CoreHandler(BaseHTTPRequestHandler):
                         self._json(200, page)
                         return
                     time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+            avatar_prefix = "/v1/avatar/"
+            if path.startswith(avatar_prefix) or path.startswith("/api/avatar/"):
+                prefix = avatar_prefix if path.startswith(avatar_prefix) else "/api/avatar/"
+                avatar_key = unquote(path[len(prefix):].strip("/"))
+                if not avatar_key:
+                    raise ApiError(404, "not_found", "Avatar key is required")
+                content, mime = self.service.resolve_avatar(avatar_key)
+                self._serve_avatar(content, mime)
+                return
             media_prefix = "/v1/media/"
             if path.startswith(media_prefix):
                 media_id = unquote(path[len(media_prefix):])
@@ -884,6 +969,14 @@ class CoreHandler(BaseHTTPRequestHandler):
         except ApiError as error:
             self._error(error)
 
+    def _serve_avatar(self, content: bytes, mime_type: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", mime_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(content)
+
     def _identity_query(self, wechat_identity_uuid: str, action: str, query: dict[str, list[str]]) -> None:
         """Identity-keyed data access (B8): chats/messages/contacts/members/media."""
         identity_record = self.service.store.wechat_identity(wechat_identity_uuid)
@@ -905,15 +998,38 @@ class CoreHandler(BaseHTTPRequestHandler):
                     cursor=query.get("cursor", [""])[0],
                     limit=limit,
                 )
+            elif action == "profile":
+                output = self.service.store.identity_profile(wechat_identity_uuid)
+                self._json(200, output)
+                return
+            elif action == "avatar":
+                content, mime = self.service.resolve_avatar(wechat_identity_uuid, wechat_identity_uuid=wechat_identity_uuid)
+                self._serve_avatar(content, mime)
+                return
+            elif action.startswith("contacts/") and action.endswith("/avatar"):
+                member_id = unquote(action[len("contacts/"):-len("/avatar")].strip("/"))
+                if not member_id:
+                    raise ApiError(404, "not_found", f"Unknown endpoint: {action}")
+                content, mime = self.service.resolve_avatar(member_id, wechat_identity_uuid=wechat_identity_uuid, member_id=member_id)
+                self._serve_avatar(content, mime)
+                return
             elif action == "contacts":
-                output = self.service.store.identity_list_contacts(wechat_identity_uuid, limit=limit)
+                query_str = query.get("query", [""])[0].strip()
+                cursor = query.get("cursor", [""])[0].strip()
+                output = self.service.store.identity_list_contacts(
+                    wechat_identity_uuid, query=query_str, limit=limit, cursor=cursor
+                )
             elif action == "media":
                 output = self.service.store.identity_list_media(wechat_identity_uuid, limit=limit)
             elif action.startswith("chats/") and action.endswith("/members"):
                 chat_id = unquote(action[len("chats/"):-len("/members")].strip("/"))
                 if not chat_id:
                     raise ApiError(404, "not_found", f"Unknown endpoint: {action}")
-                output = self.service.store.identity_list_members(wechat_identity_uuid, chat_id)
+                query_str = query.get("query", [""])[0].strip()
+                cursor = query.get("cursor", [""])[0].strip()
+                output = self.service.store.identity_list_members(
+                    wechat_identity_uuid, chat_id, query=query_str, limit=limit, cursor=cursor
+                )
             else:
                 raise ApiError(404, "not_found", f"Unknown identity endpoint: {action}")
         except StoreError as exc:

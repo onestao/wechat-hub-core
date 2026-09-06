@@ -16,6 +16,7 @@ from typing import Any, Iterable
 
 from . import identity
 from .identity import IdentityError  # noqa: F401  (re-exported for app/worker)
+from .avatar import detect_image_mime, fallback_avatar_svg
 
 
 MAX_INLINE_MEDIA_BYTES = 20 * 1024 * 1024
@@ -82,6 +83,35 @@ def stable_event_value(value: Any) -> Any:
 def clean_filename(value: str) -> str:
     name = Path(value or "upload.bin").name.replace("\x00", "")
     return name or "upload.bin"
+
+
+def resolve_contact_display_name(
+    *,
+    remark: str = "",
+    nickname: str = "",
+    alias: str = "",
+    member_id: str = "",
+) -> str:
+    """Contact display name priority: remark -> nickname -> alias -> member_id."""
+    return str(remark or "").strip() or str(nickname or "").strip() or str(alias or "").strip() or str(member_id or "").strip()
+
+
+def resolve_group_member_display_name(
+    *,
+    group_nickname: str = "",
+    remark: str = "",
+    nickname: str = "",
+    alias: str = "",
+    member_id: str = "",
+) -> str:
+    """Group member display name priority: group_nickname -> remark -> nickname -> alias -> member_id."""
+    return (
+        str(group_nickname or "").strip()
+        or str(remark or "").strip()
+        or str(nickname or "").strip()
+        or str(alias or "").strip()
+        or str(member_id or "").strip()
+    )
 
 
 class CoreStore:
@@ -169,6 +199,11 @@ class CoreStore:
                     display_name TEXT NOT NULL,
                     alias TEXT NOT NULL DEFAULT '',
                     remark TEXT NOT NULL DEFAULT '',
+                    nickname TEXT NOT NULL DEFAULT '',
+                    avatar_ref TEXT NOT NULL DEFAULT '',
+                    head_img_md5 TEXT NOT NULL DEFAULT '',
+                    big_head_url TEXT NOT NULL DEFAULT '',
+                    small_head_url TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL,
                     digest TEXT NOT NULL,
                     PRIMARY KEY (account_id, member_id),
@@ -181,12 +216,25 @@ class CoreStore:
                     member_id TEXT NOT NULL,
                     display_name TEXT NOT NULL,
                     alias TEXT NOT NULL DEFAULT '',
+                    group_nickname TEXT NOT NULL DEFAULT '',
+                    remark TEXT NOT NULL DEFAULT '',
+                    nickname TEXT NOT NULL DEFAULT '',
+                    avatar_ref TEXT NOT NULL DEFAULT '',
                     is_self INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL,
                     digest TEXT NOT NULL,
                     PRIMARY KEY (account_id, chat_id, member_id),
                     FOREIGN KEY (account_id, chat_id) REFERENCES chats(account_id, chat_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS avatar_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    mime_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    content BLOB NOT NULL,
+                    fetched_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_avatar_cache_fetched ON avatar_cache(fetched_at);
                 CREATE INDEX IF NOT EXISTS idx_members_account_chat ON chat_members(account_id, chat_id);
 
                 CREATE TABLE IF NOT EXISTS messages (
@@ -349,6 +397,25 @@ class CoreStore:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN instance_uuid TEXT NOT NULL DEFAULT ''")
             if "wechat_identity_uuid" not in columns:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN wechat_identity_uuid TEXT NOT NULL DEFAULT ''")
+        contact_cols = {row[1] for row in conn.execute("PRAGMA table_info(contacts)")}
+        for col in ("nickname", "avatar_ref", "head_img_md5", "big_head_url", "small_head_url"):
+            if col not in contact_cols:
+                conn.execute(f"ALTER TABLE contacts ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        member_cols = {row[1] for row in conn.execute("PRAGMA table_info(chat_members)")}
+        for col in ("group_nickname", "remark", "nickname", "avatar_ref"):
+            if col not in member_cols:
+                conn.execute(f"ALTER TABLE chat_members ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        existing_tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "avatar_cache" not in existing_tables:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS avatar_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    mime_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    content BLOB NOT NULL,
+                    fetched_at TEXT NOT NULL
+                )
+            """)
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_messages_identity_chat
@@ -778,26 +845,55 @@ class CoreStore:
         member_id = str(contact.get("member_id") or "").strip()
         if not member_id:
             return
+        remark = str(contact.get("remark") or "").strip()
+        nickname = str(contact.get("nickname") or contact.get("nick_name") or "").strip()
+        alias = str(contact.get("alias") or "").strip()
+        avatar_ref = str(contact.get("avatar_ref") or contact.get("avatar_url") or "").strip()
+        head_img_md5 = str(contact.get("head_img_md5") or "").strip()
+        big_head_url = str(contact.get("big_head_url") or "").strip()
+        small_head_url = str(contact.get("small_head_url") or "").strip()
+        display_name = str(
+            contact.get("display_name")
+            or resolve_contact_display_name(remark=remark, nickname=nickname, alias=alias, member_id=member_id)
+        )
         value = {
-            "display_name": str(contact.get("display_name") or member_id),
-            "alias": str(contact.get("alias") or ""),
-            "remark": str(contact.get("remark") or ""),
+            "display_name": display_name,
+            "alias": alias,
+            "remark": remark,
+            "nickname": nickname,
+            "avatar_ref": avatar_ref,
+            "head_img_md5": head_img_md5,
+            "big_head_url": big_head_url,
+            "small_head_url": small_head_url,
         }
         with self.connection() as conn:
             gate = identity.sync_gate(conn, account_id)
             conn.execute(
                 """
-                INSERT INTO contacts (account_id, member_id, instance_uuid, wechat_identity_uuid, display_name, alias, remark, updated_at, digest)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO contacts (
+                    account_id, member_id, instance_uuid, wechat_identity_uuid,
+                    display_name, alias, remark, nickname, avatar_ref, head_img_md5,
+                    big_head_url, small_head_url, updated_at, digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, member_id) DO UPDATE SET
-                    display_name=excluded.display_name, alias=excluded.alias, remark=excluded.remark,
-                    updated_at=excluded.updated_at, digest=excluded.digest,
+                    display_name=excluded.display_name,
+                    alias=excluded.alias,
+                    remark=excluded.remark,
+                    nickname=excluded.nickname,
+                    avatar_ref=excluded.avatar_ref,
+                    head_img_md5=excluded.head_img_md5,
+                    big_head_url=excluded.big_head_url,
+                    small_head_url=excluded.small_head_url,
+                    updated_at=excluded.updated_at,
+                    digest=excluded.digest,
                     instance_uuid=CASE WHEN contacts.instance_uuid<>'' THEN contacts.instance_uuid ELSE excluded.instance_uuid END,
                     wechat_identity_uuid=CASE WHEN contacts.wechat_identity_uuid<>'' THEN contacts.wechat_identity_uuid ELSE excluded.wechat_identity_uuid END
                 """,
                 (
                     account_id, member_id, str(gate["instance"]["instance_uuid"]), str(gate["stamp_identity"]),
-                    value["display_name"], value["alias"], value["remark"], utc_now(), digest(value),
+                    value["display_name"], value["alias"], value["remark"], value["nickname"],
+                    value["avatar_ref"], value["head_img_md5"], value["big_head_url"], value["small_head_url"],
+                    utc_now(), digest(value),
                 ),
             )
 
@@ -805,26 +901,57 @@ class CoreStore:
         member_id = str(member.get("member_id") or "").strip()
         if not member_id:
             return
+        group_nickname = str(member.get("group_nickname") or member.get("group_alias") or "").strip()
+        remark = str(member.get("remark") or "").strip()
+        nickname = str(member.get("nickname") or member.get("nick_name") or "").strip()
+        alias = str(member.get("alias") or "").strip()
+        avatar_ref = str(member.get("avatar_ref") or member.get("avatar_url") or "").strip()
+        is_self = bool(member.get("is_self", False))
+        display_name = str(
+            member.get("display_name")
+            or resolve_group_member_display_name(
+                group_nickname=group_nickname,
+                remark=remark,
+                nickname=nickname,
+                alias=alias,
+                member_id=member_id,
+            )
+        )
         value = {
-            "display_name": str(member.get("display_name") or member_id),
-            "alias": str(member.get("alias") or ""),
-            "is_self": bool(member.get("is_self", False)),
+            "display_name": display_name,
+            "alias": alias,
+            "group_nickname": group_nickname,
+            "remark": remark,
+            "nickname": nickname,
+            "avatar_ref": avatar_ref,
+            "is_self": is_self,
         }
         with self.connection() as conn:
             gate = identity.sync_gate(conn, account_id)
             conn.execute(
                 """
-                INSERT INTO chat_members (account_id, chat_id, member_id, instance_uuid, wechat_identity_uuid, display_name, alias, is_self, updated_at, digest)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chat_members (
+                    account_id, chat_id, member_id, instance_uuid, wechat_identity_uuid,
+                    display_name, alias, group_nickname, remark, nickname, avatar_ref,
+                    is_self, updated_at, digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, chat_id, member_id) DO UPDATE SET
-                    display_name=excluded.display_name, alias=excluded.alias, is_self=excluded.is_self,
-                    updated_at=excluded.updated_at, digest=excluded.digest,
+                    display_name=excluded.display_name,
+                    alias=excluded.alias,
+                    group_nickname=excluded.group_nickname,
+                    remark=excluded.remark,
+                    nickname=excluded.nickname,
+                    avatar_ref=excluded.avatar_ref,
+                    is_self=excluded.is_self,
+                    updated_at=excluded.updated_at,
+                    digest=excluded.digest,
                     instance_uuid=CASE WHEN chat_members.instance_uuid<>'' THEN chat_members.instance_uuid ELSE excluded.instance_uuid END,
                     wechat_identity_uuid=CASE WHEN chat_members.wechat_identity_uuid<>'' THEN chat_members.wechat_identity_uuid ELSE excluded.wechat_identity_uuid END
                 """,
                 (
                     account_id, chat_id, member_id, str(gate["instance"]["instance_uuid"]), str(gate["stamp_identity"]),
-                    value["display_name"], value["alias"], int(value["is_self"]), utc_now(), digest(value),
+                    value["display_name"], value["alias"], value["group_nickname"], value["remark"],
+                    value["nickname"], value["avatar_ref"], int(value["is_self"]), utc_now(), digest(value),
                 ),
             )
 
@@ -1198,48 +1325,257 @@ class CoreStore:
             next_cursor = base64.urlsafe_b64encode(str(offset + len(rows)).encode("ascii")).decode("ascii").rstrip("=")
         return {"wechat_identity_uuid": str(wechat_identity_uuid), "messages": [self._message_row(row) for row in rows], "next_cursor": next_cursor}
 
-    def identity_list_contacts(self, wechat_identity_uuid: str, *, limit: int = 200) -> dict[str, Any]:
+    def identity_list_contacts(
+        self,
+        wechat_identity_uuid: str,
+        *,
+        query: str = "",
+        limit: int = 200,
+        cursor: str = "",
+    ) -> dict[str, Any]:
         limit = max(1, min(int(limit), 500))
+        offset = 0
+        if cursor:
+            try:
+                decoded = base64.urlsafe_b64decode(cursor.encode("ascii") + b"===").decode("ascii")
+                offset = max(0, int(decoded))
+            except (ValueError, UnicodeDecodeError):
+                raise StoreError("invalid_cursor", "cursor is not valid for this Core", details={"field": "cursor"})
+
+        statement = "SELECT * FROM contacts WHERE wechat_identity_uuid=?"
+        args: list[Any] = [str(wechat_identity_uuid)]
+        if query:
+            q = f"%{query}%"
+            statement += " AND (display_name LIKE ? OR remark LIKE ? OR nickname LIKE ? OR alias LIKE ? OR member_id LIKE ?)"
+            args.extend([q, q, q, q, q])
+        statement += " ORDER BY display_name COLLATE NOCASE ASC, member_id ASC LIMIT ? OFFSET ?"
+        args.extend([limit + 1, offset])
+
         with self.connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM contacts WHERE wechat_identity_uuid=? ORDER BY display_name, member_id LIMIT ?",
-                (str(wechat_identity_uuid), limit),
-            ).fetchall()
+            rows = conn.execute(statement, tuple(args)).fetchall()
+
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        next_cursor = ""
+        if has_more:
+            next_cursor = base64.urlsafe_b64encode(str(offset + len(rows)).encode("ascii")).decode("ascii").rstrip("=")
+
         contacts = [
             {
                 "account_id": row["account_id"],
+                "wechat_identity_uuid": str(row["wechat_identity_uuid"] or wechat_identity_uuid),
                 "member_id": row["member_id"],
                 "display_name": row["display_name"],
-                "alias": row["alias"],
-                "remark": row["remark"],
+                "remark": row["remark"] if "remark" in row.keys() else "",
+                "nickname": row["nickname"] if "nickname" in row.keys() else "",
+                "alias": row["alias"] if "alias" in row.keys() else "",
+                "avatar_ref": row["avatar_ref"] if "avatar_ref" in row.keys() else "",
+                "avatar_url": f"/v1/identities/{wechat_identity_uuid}/contacts/{row['member_id']}/avatar",
+                "head_img_md5": row["head_img_md5"] if "head_img_md5" in row.keys() else "",
                 "updated_at": row["updated_at"],
             }
             for row in rows
         ]
-        return {"wechat_identity_uuid": str(wechat_identity_uuid), "contacts": contacts}
+        return {
+            "wechat_identity_uuid": str(wechat_identity_uuid),
+            "contacts": contacts,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "limit": limit,
+        }
 
-    def identity_list_members(self, wechat_identity_uuid: str, chat_id: str) -> dict[str, Any]:
+    def identity_list_members(
+        self,
+        wechat_identity_uuid: str,
+        chat_id: str,
+        *,
+        query: str = "",
+        limit: int = 200,
+        cursor: str = "",
+    ) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 500))
+        offset = 0
+        if cursor:
+            try:
+                decoded = base64.urlsafe_b64decode(cursor.encode("ascii") + b"===").decode("ascii")
+                offset = max(0, int(decoded))
+            except (ValueError, UnicodeDecodeError):
+                raise StoreError("invalid_cursor", "cursor is not valid for this Core", details={"field": "cursor"})
+
+        statement = "SELECT * FROM chat_members WHERE wechat_identity_uuid=? AND chat_id=?"
+        args: list[Any] = [str(wechat_identity_uuid), str(chat_id)]
+        if query:
+            q = f"%{query}%"
+            statement += " AND (display_name LIKE ? OR group_nickname LIKE ? OR remark LIKE ? OR nickname LIKE ? OR alias LIKE ? OR member_id LIKE ?)"
+            args.extend([q, q, q, q, q, q])
+        statement += " ORDER BY display_name COLLATE NOCASE ASC, member_id ASC LIMIT ? OFFSET ?"
+        args.extend([limit + 1, offset])
+
         with self.connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM chat_members
-                WHERE wechat_identity_uuid=? AND chat_id=?
-                ORDER BY display_name, member_id
-                """,
-                (str(wechat_identity_uuid), str(chat_id)),
-            ).fetchall()
+            rows = conn.execute(statement, tuple(args)).fetchall()
+
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        next_cursor = ""
+        if has_more:
+            next_cursor = base64.urlsafe_b64encode(str(offset + len(rows)).encode("ascii")).decode("ascii").rstrip("=")
+
         members = [
             {
                 "account_id": row["account_id"],
+                "wechat_identity_uuid": str(row["wechat_identity_uuid"] or wechat_identity_uuid),
                 "chat_id": row["chat_id"],
                 "member_id": row["member_id"],
+                "group_nickname": row["group_nickname"] if "group_nickname" in row.keys() else "",
                 "display_name": row["display_name"],
-                "alias": row["alias"],
+                "remark": row["remark"] if "remark" in row.keys() else "",
+                "nickname": row["nickname"] if "nickname" in row.keys() else "",
+                "alias": row["alias"] if "alias" in row.keys() else "",
+                "avatar_ref": row["avatar_ref"] if "avatar_ref" in row.keys() else "",
+                "avatar_url": f"/v1/identities/{wechat_identity_uuid}/contacts/{row['member_id']}/avatar",
                 "is_self": bool(row["is_self"]),
+                "updated_at": row["updated_at"],
             }
             for row in rows
         ]
-        return {"wechat_identity_uuid": str(wechat_identity_uuid), "chat_id": str(chat_id), "members": members}
+        return {
+            "wechat_identity_uuid": str(wechat_identity_uuid),
+            "chat_id": str(chat_id),
+            "members": members,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "limit": limit,
+        }
+
+    def identity_contact(self, wechat_identity_uuid: str, member_id: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM contacts WHERE wechat_identity_uuid=? AND member_id=?",
+                (str(wechat_identity_uuid), str(member_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "account_id": row["account_id"],
+            "wechat_identity_uuid": str(row["wechat_identity_uuid"]),
+            "member_id": row["member_id"],
+            "display_name": row["display_name"],
+            "remark": row["remark"] if "remark" in row.keys() else "",
+            "nickname": row["nickname"] if "nickname" in row.keys() else "",
+            "alias": row["alias"] if "alias" in row.keys() else "",
+            "avatar_ref": row["avatar_ref"] if "avatar_ref" in row.keys() else "",
+            "avatar_url": f"/v1/identities/{wechat_identity_uuid}/contacts/{row['member_id']}/avatar",
+            "head_img_md5": row["head_img_md5"] if "head_img_md5" in row.keys() else "",
+            "big_head_url": row["big_head_url"] if "big_head_url" in row.keys() else "",
+            "small_head_url": row["small_head_url"] if "small_head_url" in row.keys() else "",
+            "updated_at": row["updated_at"],
+        }
+
+    def identity_member(self, wechat_identity_uuid: str, chat_id: str, member_id: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM chat_members WHERE wechat_identity_uuid=? AND chat_id=? AND member_id=?",
+                (str(wechat_identity_uuid), str(chat_id), str(member_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "account_id": row["account_id"],
+            "wechat_identity_uuid": str(row["wechat_identity_uuid"]),
+            "chat_id": row["chat_id"],
+            "member_id": row["member_id"],
+            "group_nickname": row["group_nickname"] if "group_nickname" in row.keys() else "",
+            "display_name": row["display_name"],
+            "remark": row["remark"] if "remark" in row.keys() else "",
+            "nickname": row["nickname"] if "nickname" in row.keys() else "",
+            "alias": row["alias"] if "alias" in row.keys() else "",
+            "avatar_ref": row["avatar_ref"] if "avatar_ref" in row.keys() else "",
+            "avatar_url": f"/v1/identities/{wechat_identity_uuid}/contacts/{row['member_id']}/avatar",
+            "is_self": bool(row["is_self"]),
+            "updated_at": row["updated_at"],
+        }
+
+    def identity_profile(self, wechat_identity_uuid: str) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM wechat_identities WHERE wechat_identity_uuid=?",
+                (str(wechat_identity_uuid),),
+            ).fetchone()
+        if row is None:
+            raise StoreError("identity_not_found", f"Unknown wechat_identity_uuid: {wechat_identity_uuid}", status=404)
+        wechat_user_id = str(row["wechat_user_id"] or "")
+        nickname = str(row["nickname"] or "")
+        effective_nickname = nickname or wechat_user_id
+        avatar_ref = str(row["avatar_ref"] or "")
+        avatar_url = avatar_ref if avatar_ref.startswith(("/", "http://", "https://")) else f"/v1/identities/{wechat_identity_uuid}/avatar"
+        return {
+            "wechat_identity_uuid": str(row["wechat_identity_uuid"]),
+            "wechat_user_id": wechat_user_id,
+            "nickname": effective_nickname,
+            "avatar_ref": avatar_ref,
+            "avatar_url": avatar_url,
+            "profile_json": parse_json(row["profile_json"], {}),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def update_identity_profile(
+        self,
+        wechat_identity_uuid: str,
+        *,
+        nickname: str | None = None,
+        avatar_ref: str | None = None,
+        profile_json: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            existing = conn.execute(
+                "SELECT * FROM wechat_identities WHERE wechat_identity_uuid=?",
+                (str(wechat_identity_uuid),),
+            ).fetchone()
+            if existing is None:
+                raise StoreError("identity_not_found", f"Unknown wechat_identity_uuid: {wechat_identity_uuid}", status=404)
+            updates: list[str] = ["updated_at=?"]
+            args: list[Any] = [utc_now()]
+            if nickname is not None:
+                updates.append("nickname=?")
+                args.append(str(nickname))
+            if avatar_ref is not None:
+                updates.append("avatar_ref=?")
+                args.append(str(avatar_ref))
+            if profile_json is not None:
+                updates.append("profile_json=?")
+                args.append(compact_json(profile_json))
+            args.append(str(wechat_identity_uuid))
+            conn.execute(
+                f"UPDATE wechat_identities SET {', '.join(updates)} WHERE wechat_identity_uuid=?",
+                tuple(args),
+            )
+        return self.identity_profile(wechat_identity_uuid)
+
+    def get_avatar_cache(self, cache_key: str) -> tuple[bytes, str] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT content, mime_type FROM avatar_cache WHERE cache_key=?",
+                (str(cache_key),),
+            ).fetchone()
+        if row is None:
+            return None
+        return bytes(row["content"]), str(row["mime_type"])
+
+    def set_avatar_cache(self, cache_key: str, content: bytes, mime_type: str) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO avatar_cache (cache_key, mime_type, size_bytes, content, fetched_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    mime_type=excluded.mime_type,
+                    size_bytes=excluded.size_bytes,
+                    content=excluded.content,
+                    fetched_at=excluded.fetched_at
+                """,
+                (str(cache_key), str(mime_type), len(content), sqlite3.Binary(content), utc_now()),
+            )
 
     def identity_list_media(self, wechat_identity_uuid: str, *, limit: int = 200) -> dict[str, Any]:
         limit = max(1, min(int(limit), 500))
