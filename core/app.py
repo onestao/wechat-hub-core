@@ -480,6 +480,35 @@ class CoreService:
             self._apply_runtime_status(result["status"])
         return result
 
+    def update_runtime_account(self, account_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Operator-facing display_name update (Identity v2 contract §2.1).
+
+        ``display_name`` is freely mutable and never touches resources or
+        bindings.  The request forwards only ``display_name`` to Runtime so the
+        fail-closed alias-rename guard in Runtime control stays the single
+        authority for identity-affecting renames (Gate F8).
+        """
+        self.require_account(account_id)
+        unexpected = sorted(set(payload) - {"display_name"})
+        if unexpected:
+            raise ApiError(
+                400,
+                "invalid_request",
+                f"update accepts only display_name; unexpected fields: {unexpected}",
+                {"fields": unexpected},
+            )
+        display_name = str(payload.get("display_name") or "").strip()
+        if not display_name:
+            raise ApiError(400, "invalid_request", "display_name must be a non-empty string", {"field": "display_name"})
+        result = self._runtime_request("update", account_id=account_id, display_name=display_name)
+        try:
+            result["registry_reload"] = self.reload_registry(force=True)
+        except RegistryError as exc:
+            raise ApiError(500, "registry_reload_failed", str(exc)) from exc
+        if isinstance(result.get("status"), dict):
+            self._apply_runtime_status(result["status"])
+        return result
+
     def runtime_account_action(self, account_id: str, action: str) -> dict[str, Any]:
         if action not in {"start", "stop", "restart"}:
             raise ApiError(404, "not_found", f"Unknown Runtime account action: {action}")
@@ -1070,6 +1099,9 @@ class CoreHandler(BaseHTTPRequestHandler):
                         return
                     if parts[1] == "confirm-switch":
                         self._json(200, self.service.confirm_identity_switch(account_id, payload))
+                        return
+                    if parts[1] == "update":
+                        self._json(200, self.service.update_runtime_account(account_id, payload))
                         return
                     self._json(200, self.service.runtime_account_action(account_id, parts[1]))
                     return
