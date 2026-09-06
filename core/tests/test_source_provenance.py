@@ -366,7 +366,7 @@ class SourceProvenanceReleaseLineageTests(unittest.TestCase):
             acc.keys_file.write_text("{}", encoding="utf-8")
             return {"returncode": 0}
 
-        with patch("memory.decrypt_sync.refresh_decrypted", return_value={"failed": 0}), patch(
+        with patch("memory.decrypt_sync.refresh_decrypted", return_value={"updated": [], "skipped": [], "missing_key": [], "failed": []}), patch(
             "memory.media_sync.sync_media", return_value={}
         ), patch("memory.memory_ingest.ingest_memory", return_value={}), patch(
             "core.key_extract.extract_account_keys", side_effect=_mock_key_extract
@@ -420,7 +420,7 @@ class SourceProvenanceReleaseLineageTests(unittest.TestCase):
 
         # If any decrypt/ingest stage were reached against the rejected source,
         # these mocks would make the test fail by being invoked.
-        refresh_mock = MagicMock(return_value={"failed": 0})
+        refresh_mock = MagicMock(return_value={"updated": [], "skipped": [], "missing_key": [], "failed": []})
         ingest_mock = MagicMock(return_value={})
         media_mock = MagicMock(return_value={})
 
