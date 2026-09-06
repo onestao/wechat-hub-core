@@ -163,6 +163,9 @@ class CoreService:
             accounts_input.append(
                 {
                     "account_id": config.account_id,
+                    "instance_uuid": config.instance_uuid or str(runtime.get("instance_uuid") or ""),
+                    "runtime_alias": config.runtime_alias or str(runtime.get("runtime_alias") or config.account_id),
+                    "resource_key": config.resource_key or str(runtime.get("resource_key") or config.account_id),
                     "display_name": str(stored.get("display_name") or config.display_name),
                     "runtime_provider": str(runtime.get("runtime_provider") or config.runtime_provider or "legacy"),
                     "runtime": runtime,
@@ -342,9 +345,9 @@ class CoreService:
                 continue
             status.update(
                 {
-                    "instance_uuid": view["instance_uuid"],
-                    "runtime_alias": view["runtime_alias"],
-                    "resource_key": view["resource_key"],
+                    "instance_uuid": status.get("instance_uuid") or view["instance_uuid"],
+                    "runtime_alias": status.get("runtime_alias") or view["runtime_alias"],
+                    "resource_key": status.get("resource_key") or view["resource_key"],
                     "wechat_identity_uuid": view["wechat_identity_uuid"],
                     "identity_binding_state": view["identity_binding_state"],
                     "wechat_profile": view["wechat_profile"],
@@ -353,12 +356,34 @@ class CoreService:
         return output
 
     def _apply_runtime_status(self, status: dict[str, Any]) -> None:
-        account_id = str(status.get("account_id") or "").strip()
+        account_id = str(status.get("account_id") or status.get("id") or "").strip()
         config = self.registry.get(account_id) if account_id else None
         if config is None:
             return
+        instance_uuid = str(status.get("instance_uuid") or config.instance_uuid or "").strip()
+        runtime_alias = str(status.get("runtime_alias") or config.runtime_alias or account_id).strip()
+        resource_key = str(status.get("resource_key") or config.resource_key or account_id).strip()
+        display_name = str(status.get("display_name") or config.display_name)
+        provider = str(status.get("runtime_provider") or config.runtime_provider or "legacy")
+
+        if instance_uuid or resource_key:
+            self.store.ensure_instance(
+                account_id,
+                instance_uuid=instance_uuid,
+                runtime_alias=runtime_alias,
+                resource_key=resource_key,
+                display_name=display_name,
+                runtime_provider=provider,
+            )
+
         existing = self.store.account(account_id)
         runtime = config.public_runtime()
+        if instance_uuid:
+            runtime["instance_uuid"] = instance_uuid
+        if runtime_alias:
+            runtime["runtime_alias"] = runtime_alias
+        if resource_key:
+            runtime["resource_key"] = resource_key
         runtime["registered"] = True
         runtime.update(
             {

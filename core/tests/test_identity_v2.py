@@ -842,5 +842,203 @@ class WorkerObservationTest(IdentityTestBase):
         self.assertIn("error", status)
 
 
+class IdentityV2CrossModuleIntegrationTests(unittest.TestCase):
+    """Step 4 Cross-module fixture ingestion & Foundation Gates F1-F10 verification."""
+
+    def setUp(self):
+        self.temp_root = Path(tempfile.mkdtemp(prefix="core-identity-v2-int-"))
+        (self.temp_root / "runtime").mkdir(parents=True, exist_ok=True)
+        self.registry_file = self.temp_root / "accounts.json"
+        self.store = CoreStore(self.temp_root / "core.sqlite")
+
+    def tearDown(self):
+        if hasattr(self, "server"):
+            self.server.shutdown()
+            self.server.server_close()
+            self.thread.join(timeout=5)
+        shutil.rmtree(self.temp_root, ignore_errors=True)
+
+    def _start_service(self, accounts_fixture: list[dict]):
+        self.registry_file.write_text(json.dumps({"version": 2, "accounts": accounts_fixture}), encoding="utf-8")
+        from core.registry import load_registry
+        self.registry = load_registry(self.registry_file, root=self.temp_root)
+        self.service = CoreService(root=self.temp_root, registry=self.registry, store=self.store)
+        self.server = create_server("127.0.0.1", 0, self.service)
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def test_step4_runtime_v2_fixture_ingestion_preserves_canonical_keys(self):
+        """P0-I1, P0-I3, Gate F1/F2: Runtime v2 fixture ingested into Core preserves instance_uuid and resource_key."""
+        fixture = [
+            {
+                "id": "work",
+                "account_id": "work",
+                "runtime_alias": "work",
+                "instance_uuid": "11111111-2222-4333-8444-555555555555",
+                "resource_key": "legacy-work-resource",
+                "display_name": "工作微信",
+                "runtime_provider": "agent_wechat",
+                "logged_in_user": "wxid_work_a",
+            }
+        ]
+        self._start_service(fixture)
+
+        # 1. Verify single account endpoint GET /v1/accounts/work
+        status, body = http_json(self.base_url, "GET", "/v1/accounts/work")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["instance_uuid"], "11111111-2222-4333-8444-555555555555")
+        self.assertEqual(body["resource_key"], "legacy-work-resource")
+        self.assertEqual(body["runtime_alias"], "work")
+        self.assertEqual(body["display_name"], "工作微信")
+        self.assertEqual(body["account_id"], "work")
+        self.assertEqual(body["logged_in_user"], "wxid_work_a")
+        self.assertEqual(body["identity_binding_state"], "bound")
+        self.assertEqual(body["wechat_profile"]["wechat_user_id"], "wxid_work_a")
+
+        # 2. Verify account list GET /v1/accounts
+        status, listing = http_json(self.base_url, "GET", "/v1/accounts")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listing["accounts"]), 1)
+        acc = listing["accounts"][0]
+        self.assertEqual(acc["instance_uuid"], "11111111-2222-4333-8444-555555555555")
+        self.assertEqual(acc["resource_key"], "legacy-work-resource")
+
+        # 3. Verify SQLite runtime_instances has exactly one row with exact keys (NO shadow UUID)
+        with sqlite3.connect(self.temp_root / "core.sqlite") as conn:
+            rows = conn.execute("SELECT instance_uuid, runtime_alias, resource_key, display_name FROM runtime_instances").fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][0], "11111111-2222-4333-8444-555555555555")
+            self.assertEqual(rows[0][1], "work")
+            self.assertEqual(rows[0][2], "legacy-work-resource")
+            self.assertEqual(rows[0][3], "工作微信")
+
+        # 4. Verify runtime status enrichment does not overwrite Runtime's instance_uuid
+        with patch.object(self.service, "_runtime_request", return_value={"accounts": [dict(fixture[0])]}):
+            status, rt_accounts = http_json(self.base_url, "GET", "/v1/runtime/accounts")
+            self.assertEqual(status, 200)
+            rt_acc = rt_accounts["accounts"][0]
+            self.assertEqual(rt_acc["instance_uuid"], "11111111-2222-4333-8444-555555555555")
+            self.assertEqual(rt_acc["resource_key"], "legacy-work-resource")
+            self.assertEqual(rt_acc["identity_binding_state"], "bound")
+
+    def test_gate_f8_alias_rename_fail_closed_and_display_name_mutable(self):
+        """Gate F8 (P0-I2): alias rename attempt is fail-closed; display_name update is allowed and safe."""
+        fixture = [
+            {
+                "id": "work",
+                "account_id": "work",
+                "runtime_alias": "work",
+                "instance_uuid": "11111111-2222-4333-8444-555555555555",
+                "resource_key": "legacy-work-resource",
+                "display_name": "工作微信",
+                "runtime_provider": "agent_wechat",
+                "logged_in_user": "wxid_work_a",
+            }
+        ]
+        self._start_service(fixture)
+
+        # Attempt to rename runtime_alias must raise alias_rename_deferred (HTTP 400)
+        with self.assertRaises(IdentityError) as ctx:
+            self.store.ensure_instance(
+                "work",
+                instance_uuid="11111111-2222-4333-8444-555555555555",
+                runtime_alias="company",
+            )
+        self.assertEqual(ctx.exception.code, "alias_rename_deferred")
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertIn("is deferred in this release", str(ctx.exception))
+
+        # Updating display_name succeeds freely without altering instance_uuid or resource_key
+        updated = self.store.ensure_instance(
+            "work",
+            instance_uuid="11111111-2222-4333-8444-555555555555",
+            display_name="新工作微信",
+        )
+        self.assertEqual(updated["instance_uuid"], "11111111-2222-4333-8444-555555555555")
+        self.assertEqual(updated["resource_key"], "legacy-work-resource")
+        self.assertEqual(updated["display_name"], "新工作微信")
+        self.assertEqual(updated["runtime_alias"], "work")
+
+    def test_gate_f2_instance_uuid_conflict_fails_closed(self):
+        """Gate F2: Registering a conflicting instance_uuid for an existing alias is fail-closed."""
+        fixture = [
+            {
+                "id": "work",
+                "account_id": "work",
+                "runtime_alias": "work",
+                "instance_uuid": "11111111-2222-4333-8444-555555555555",
+                "resource_key": "legacy-work-resource",
+                "display_name": "工作微信",
+                "runtime_provider": "agent_wechat",
+                "logged_in_user": "wxid_work_a",
+            }
+        ]
+        self._start_service(fixture)
+
+        with self.assertRaises(IdentityError) as ctx:
+            self.store.ensure_instance(
+                "work",
+                instance_uuid="99999999-8888-4777-a666-555555555555",
+                runtime_alias="work",
+            )
+        self.assertEqual(ctx.exception.code, "instance_uuid_conflict")
+        self.assertEqual(ctx.exception.status, 409)
+
+    def test_e2e_real_runtime_registry_to_core_alignment(self):
+        """Full end-to-end verification: real Runtime Registry -> Core load_registry -> status alignment."""
+        runtime_scripts = Path(__file__).resolve().parents[6] / "work" / "runtime" / "root" / "scripts" / "wechat"
+        if str(runtime_scripts) not in sys.path:
+            sys.path.insert(0, str(runtime_scripts))
+        import wechat_runtime
+        import wechat_runtime_control
+
+        paths = wechat_runtime.RuntimePaths(
+            registry_file=self.registry_file,
+            account_home_root=self.temp_root / "accounts",
+            runtime_dir=self.temp_root / "run",
+        )
+        reg = wechat_runtime.Registry(paths)
+        with patch.object(wechat_runtime, "require_root"):
+            rt_account = wechat_runtime.register_account(
+                reg,
+                "work",
+                ":1",
+                True,
+                label="工作微信",
+                provider="agent_wechat",
+                instance_uuid="11111111-2222-4333-8444-555555555555",
+                runtime_alias="work",
+                resource_key="legacy-work-resource",
+            )
+
+        self.assertEqual(rt_account["instance_uuid"], "11111111-2222-4333-8444-555555555555")
+        self.assertEqual(rt_account["resource_key"], "legacy-work-resource")
+
+        # Load into Core
+        from core.registry import load_registry
+        core_reg = load_registry(self.registry_file, root=self.temp_root)
+        cfg = core_reg.require("work")
+        self.assertEqual(cfg.instance_uuid, "11111111-2222-4333-8444-555555555555")
+        self.assertEqual(cfg.resource_key, "legacy-work-resource")
+        self.assertEqual(cfg.runtime_alias, "work")
+
+        service = CoreService(root=self.temp_root, registry=core_reg, store=self.store)
+        server = create_server("127.0.0.1", 0, service)
+        base = f"http://127.0.0.1:{server.server_port}"
+        th = threading.Thread(target=server.serve_forever, daemon=True)
+        th.start()
+        try:
+            status, acc = http_json(base, "GET", "/v1/accounts/work")
+            self.assertEqual(status, 200)
+            self.assertEqual(acc["instance_uuid"], rt_account["instance_uuid"])
+            self.assertEqual(acc["resource_key"], rt_account["resource_key"])
+            self.assertEqual(acc["runtime_alias"], rt_account["runtime_alias"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            th.join(timeout=5)
+
+
 if __name__ == "__main__":
     unittest.main()

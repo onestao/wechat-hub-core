@@ -28,6 +28,9 @@ from typing import Any, Iterable
 
 
 WXID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{4,79}\Z")
+INSTANCE_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 UNRESOLVED_NICKNAME = "未确认历史微信"
 DATA_DIR_PLACEHOLDERS = {
     "__runtime_unresolved__",
@@ -154,42 +157,104 @@ def ensure_instance(
     conn: sqlite3.Connection,
     account_id: str,
     *,
+    instance_uuid: str = "",
+    runtime_alias: str = "",
+    resource_key: str = "",
     display_name: str = "",
     runtime_provider: str = "",
 ) -> dict[str, Any]:
-    """Create-or-get the runtime instance row for a legacy account alias.
+    """Create-or-get the runtime instance row with authoritative Identity v2 keys.
 
-    ``runtime_alias`` equals the legacy ``account_id`` inside the compat window
-    and ``resource_key`` is frozen to the alias at creation, mirroring the
-    pre-existing ``runtime/accounts/<account_id>`` resource suffix.  Resource
-    keys are never rewritten; alias/display/provider stay controlled-mutable.
+    ``instance_uuid`` is the immutable canonical primary key.  If provided by
+    the Runtime (or caller), it takes precedence.  ``resource_key`` is the
+    immutable physical resource binding key.  ``runtime_alias`` is the
+    controlled technical alias (alias rename is deferred/fail-closed in this
+    release, Gate F8).
     """
-    account_id = str(account_id)
-    existing = instance_by_alias(conn, account_id)
-    if existing is not None:
-        updates: list[str] = []
-        args: list[Any] = []
-        if display_name and existing["display_name"] != display_name:
+    account_id = str(account_id or "").strip()
+    instance_uuid = str(instance_uuid or "").strip()
+    runtime_alias = str(runtime_alias or "").strip()
+    resource_key = str(resource_key or "").strip()
+    target_alias = runtime_alias or account_id
+
+    # 1. If instance_uuid is given, look up by uuid first
+    if instance_uuid:
+        existing = instance_by_uuid(conn, instance_uuid)
+        if existing is not None:
+            if runtime_alias and existing["runtime_alias"] != runtime_alias:
+                raise IdentityError(
+                    "alias_rename_deferred",
+                    400,
+                    f"runtime_alias rename ({existing['runtime_alias']!r} -> {runtime_alias!r}) is deferred in this release to protect legacy account bindings; display_name can be updated freely",
+                )
+            updates: list[str] = []
+            args: list[Any] = []
+            if display_name and existing["display_name"] != display_name:
+                updates.append("display_name=?")
+                args.append(display_name)
+            if runtime_provider and existing["runtime_provider"] != runtime_provider:
+                updates.append("runtime_provider=?")
+                args.append(runtime_provider)
+            if resource_key and existing["resource_key"] != resource_key and not existing["resource_key"]:
+                updates.append("resource_key=?")
+                args.append(resource_key)
+            if updates:
+                updates.append("updated_at=?")
+                args.append(utc_now())
+                args.append(existing["instance_uuid"])
+                conn.execute(f"UPDATE runtime_instances SET {', '.join(updates)} WHERE instance_uuid=?", tuple(args))
+                existing = instance_by_uuid(conn, instance_uuid) or existing
+            return existing
+
+        existing_by_alias = instance_by_alias(conn, target_alias)
+        if existing_by_alias is not None:
+            raise IdentityError(
+                "instance_uuid_conflict",
+                409,
+                f"alias {target_alias!r} is already bound to instance_uuid {existing_by_alias['instance_uuid']!r}, cannot overwrite with {instance_uuid!r}",
+            )
+
+    # 2. Look up by alias or account_id
+    existing_by_alias = instance_by_alias(conn, target_alias)
+    if existing_by_alias is None and INSTANCE_UUID_RE.match(account_id):
+        existing_by_alias = instance_by_uuid(conn, account_id)
+
+    if existing_by_alias is not None:
+        if instance_uuid and existing_by_alias["instance_uuid"].lower() != instance_uuid.lower():
+            raise IdentityError(
+                "instance_uuid_conflict",
+                409,
+                f"alias {target_alias!r} is already bound to instance_uuid {existing_by_alias['instance_uuid']!r}, cannot overwrite with {instance_uuid!r}",
+            )
+        updates = []
+        args = []
+        if display_name and existing_by_alias["display_name"] != display_name:
             updates.append("display_name=?")
             args.append(display_name)
-        if runtime_provider and existing["runtime_provider"] != runtime_provider:
+        if runtime_provider and existing_by_alias["runtime_provider"] != runtime_provider:
             updates.append("runtime_provider=?")
             args.append(runtime_provider)
+        if resource_key and existing_by_alias["resource_key"] != resource_key:
+            if existing_by_alias["resource_key"] == existing_by_alias["runtime_alias"]:
+                updates.append("resource_key=?")
+                args.append(resource_key)
         if updates:
             updates.append("updated_at=?")
             args.append(utc_now())
-            args.append(existing["instance_uuid"])
+            args.append(existing_by_alias["instance_uuid"])
             conn.execute(f"UPDATE runtime_instances SET {', '.join(updates)} WHERE instance_uuid=?", tuple(args))
-            existing = instance_by_alias(conn, account_id) or existing
-        return existing
-    account = _one(conn, "SELECT * FROM accounts WHERE account_id=?", (account_id,))
+            existing_by_alias = instance_by_uuid(conn, existing_by_alias["instance_uuid"]) or existing_by_alias
+        return existing_by_alias
+
+    # 3. Not found: create new row
+    account = _one(conn, "SELECT * FROM accounts WHERE account_id=?", (target_alias,))
     runtime_json = parse_json_safe(account.get("runtime_json")) if account else {}
     provider = str(runtime_provider or (runtime_json or {}).get("runtime_provider") or "legacy")
     row = {
-        "instance_uuid": new_uuid(),
-        "runtime_alias": account_id,
-        "display_name": str(display_name or (account or {}).get("display_name") or account_id),
-        "resource_key": account_id,
+        "instance_uuid": instance_uuid or new_uuid(),
+        "runtime_alias": target_alias,
+        "display_name": str(display_name or (account or {}).get("display_name") or target_alias),
+        "resource_key": resource_key or target_alias,
         "runtime_provider": provider,
         "created_at": utc_now(),
         "updated_at": utc_now(),
@@ -207,8 +272,7 @@ def ensure_instance(
             ),
         )
     except sqlite3.IntegrityError:
-        # Concurrent creator won the UNIQUE(runtime_alias) race; reuse its row.
-        existing = instance_by_alias(conn, account_id)
+        existing = instance_by_uuid(conn, row["instance_uuid"]) or instance_by_alias(conn, row["runtime_alias"])
         if existing is not None:
             return existing
         raise
@@ -431,6 +495,9 @@ def observe_login(
     logged_in_user: str,
     *,
     verified_source: str,
+    instance_uuid: str = "",
+    runtime_alias: str = "",
+    resource_key: str = "",
     display_name: str = "",
     runtime_provider: str = "",
 ) -> dict[str, Any]:
@@ -449,7 +516,15 @@ def observe_login(
             400,
             f"observed logged_in_user is not a verifiable WeChat user id: {observed!r}",
         )
-    instance = ensure_instance(conn, account_id, display_name=display_name, runtime_provider=runtime_provider)
+    instance = ensure_instance(
+        conn,
+        account_id,
+        instance_uuid=instance_uuid,
+        runtime_alias=runtime_alias,
+        resource_key=resource_key,
+        display_name=display_name,
+        runtime_provider=runtime_provider,
+    )
     previous = binding_state(conn, instance["instance_uuid"], account_id)
     binding = previous["binding"]
     identity = previous["identity"]
@@ -757,14 +832,17 @@ def identity_view(conn: sqlite3.Connection, account_id: str) -> dict[str, Any]:
         "wechat_profile": {"wechat_user_id": "", "nickname": "", "avatar_url": ""},
     }
     instance = instance_by_alias(conn, account_id)
+    if instance is None and INSTANCE_UUID_RE.match(account_id):
+        instance = instance_by_uuid(conn, account_id)
     if instance is None:
         return view
-    info = binding_state(conn, instance["instance_uuid"], account_id)
+    info = binding_state(conn, instance["instance_uuid"], instance["runtime_alias"])
     identity = info["identity"]
     avatar_ref = str((identity or {}).get("avatar_ref") or "")
     view.update(
         {
             "instance_uuid": instance["instance_uuid"],
+            "runtime_alias": instance["runtime_alias"],
             "resource_key": instance["resource_key"],
             "runtime_provider": instance["runtime_provider"],
             "identity_binding_state": info["state"],
@@ -879,6 +957,9 @@ def migrate_legacy_accounts(
         instance = ensure_instance(
             conn,
             account_id,
+            instance_uuid=str(item.get("instance_uuid") or "").strip(),
+            runtime_alias=str(item.get("runtime_alias") or "").strip(),
+            resource_key=str(item.get("resource_key") or "").strip(),
             display_name=str(item.get("display_name") or ""),
             runtime_provider=str(item.get("runtime_provider") or ""),
         )

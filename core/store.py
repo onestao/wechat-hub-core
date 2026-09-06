@@ -569,12 +569,36 @@ class CoreStore:
             info["instance_uuid"] = instance["instance_uuid"]
             return info
 
+    def ensure_instance(
+        self,
+        account_id: str,
+        *,
+        instance_uuid: str = "",
+        runtime_alias: str = "",
+        resource_key: str = "",
+        display_name: str = "",
+        runtime_provider: str = "",
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            return identity.ensure_instance(
+                conn,
+                account_id,
+                instance_uuid=instance_uuid,
+                runtime_alias=runtime_alias,
+                resource_key=resource_key,
+                display_name=display_name,
+                runtime_provider=runtime_provider,
+            )
+
     def observe_login(
         self,
         account_id: str,
         logged_in_user: str,
         *,
         verified_source: str,
+        instance_uuid: str = "",
+        runtime_alias: str = "",
+        resource_key: str = "",
         display_name: str = "",
         runtime_provider: str = "",
     ) -> dict[str, Any]:
@@ -585,6 +609,9 @@ class CoreStore:
                 account_id,
                 logged_in_user,
                 verified_source=verified_source,
+                instance_uuid=instance_uuid,
+                runtime_alias=runtime_alias,
+                resource_key=resource_key,
                 display_name=display_name,
                 runtime_provider=runtime_provider,
             )

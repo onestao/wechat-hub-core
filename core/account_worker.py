@@ -79,6 +79,9 @@ class AccountWorker:
                         if account.runtime_provider == "agent_wechat"
                         else VERIFIED_SOURCE_RUNTIME_STATUS
                     ),
+                    instance_uuid=account.instance_uuid,
+                    runtime_alias=account.runtime_alias,
+                    resource_key=account.resource_key,
                 )
 
             # Second provenance assertion (Taskbook RB-003):
