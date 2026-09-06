@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .registry import AccountConfig
+from .source_provenance import DATA_DIR_PLACEHOLDERS, SourceIdentityError, valid_wxid
 
 
 _WINDOW_RE = re.compile(r"0x[0-9a-fA-F]+")
@@ -151,6 +152,79 @@ def discover_source_db(home: Path) -> tuple[Path, Path] | None:
     return source_db, source_db.parent
 
 
+def discover_agent_wechat_source_db(
+    home: Path,
+    logged_in_user: str,
+    account_id: str = "",
+) -> tuple[Path, Path] | None:
+    """Locate the AgentWechat db_storage for exactly the logged-in WeChat identity.
+
+    RB-003 fail-closed semantics:
+    1. If ``logged_in_user`` is a valid wxid:
+       - check ``<home>/Documents/xwechat_files/<logged_in_user>/db_storage`` and
+         ``<home>/xwechat_files/<logged_in_user>/db_storage``;
+       - if found, select exactly that directory (never compare mtime across wxids);
+       - if not found but other valid wxid db_storage directories exist, fail closed
+         with ``SourceIdentityError("source_identity_mismatch")`` instead of silently
+         ingesting a historical account's data under the live login;
+       - if no valid wxid directory exists at all, return ``None`` (unresolved).
+    2. If ``logged_in_user`` is missing or not a valid wxid, keep the documented
+       legacy ``discover_source_db`` mtime behavior.
+    """
+    if not valid_wxid(logged_in_user):
+        return discover_source_db(home)
+
+    bases = [home / "Documents" / "xwechat_files", home / "xwechat_files"]
+    expected_candidates: list[Path] = []
+    other_wxids: dict[str, Path] = {}
+
+    def modified(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    for base in bases:
+        if not base.is_dir():
+            continue
+        expected_path = base / logged_in_user / "db_storage"
+        if expected_path.is_dir():
+            expected_candidates.append(expected_path)
+        try:
+            children = list(base.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            child_name = child.name
+            if child_name == logged_in_user:
+                continue
+            db_storage = child / "db_storage"
+            if (
+                db_storage.is_dir()
+                and valid_wxid(child_name)
+                and child_name not in DATA_DIR_PLACEHOLDERS
+            ):
+                other_wxids[child_name] = db_storage
+
+    if expected_candidates:
+        chosen = max(expected_candidates, key=modified)
+        return chosen, chosen.parent
+
+    if other_wxids:
+        found = sorted(other_wxids.keys())
+        raise SourceIdentityError(
+            "source_identity_mismatch",
+            409,
+            f"source db identity mismatch for account {account_id or 'unknown'}: "
+            f"expected {logged_in_user} beneath {home}, but found other wxid directories: {found}",
+            details={"account_id": account_id, "expected_wxid": logged_in_user, "found_wxids": found, "source_home": str(home)},
+        )
+
+    return None
+
+
 def _agent_runtime_status(account: AccountConfig) -> dict[str, Any]:
     status_file = str(account.runtime.get("runtime_status_file") or "").strip()
     if not status_file:
@@ -191,8 +265,13 @@ def resolve_runtime_account(account: AccountConfig) -> AccountConfig:
         source_db_dir = account.source_db_dir
         wechat_base_dir = account.wechat_base_dir
         source_home = str(runtime.get("source_home") or "").strip()
+        logged_in_user = str(runtime.get("logged_in_user") or "").strip()
         if source_home:
-            discovered = discover_source_db(Path(source_home))
+            discovered = discover_agent_wechat_source_db(
+                Path(source_home),
+                logged_in_user,
+                account_id=account.account_id,
+            )
             if discovered:
                 source_db_dir, wechat_base_dir = discovered
         return replace(

@@ -15,6 +15,7 @@ from typing import Any
 from .normalize import import_account
 from .registry import AccountConfig, AccountRegistry
 from .runtime_bridge import resolve_runtime_account
+from .source_provenance import SourceIdentityError, valid_wxid, wechat_data_dir_name
 from .store import CoreStore
 
 
@@ -118,8 +119,35 @@ class AccountWorker:
         self.registry = registry
         self.store = store
 
+    def _assert_source_provenance(self, account: AccountConfig) -> None:
+        """Fail closed when the selected source directory belongs to another wxid.
+
+        RB-003: immediately before key export, decrypt and ingest, re-verify that
+        the selected source identity still matches the fresh runtime identity so
+        a historical account directory can never be ingested under the live login.
+        """
+        observed_user = str(account.runtime.get("logged_in_user") or "").strip()
+        source_wxid = wechat_data_dir_name(account.source_db_dir)
+        if not source_wxid or not valid_wxid(source_wxid):
+            return
+        if not observed_user or not valid_wxid(observed_user):
+            return
+        if source_wxid == observed_user:
+            return
+        raise SourceIdentityError(
+            "source_identity_mismatch",
+            409,
+            f"source db directory identity {source_wxid!r} does not match fresh "
+            f"logged_in_user {observed_user!r} for account {account.account_id}",
+            details={
+                "account_id": account.account_id,
+                "selected_wxid": source_wxid,
+                "expected_wxid": observed_user,
+                "source_db_dir": str(account.source_db_dir),
+            },
+        )
+
     def run_account(self, account: AccountConfig, *, force_refresh: bool = False) -> dict[str, Any]:
-        account = resolve_runtime_account(account)
         started = time.monotonic()
         status: dict[str, Any] = {
             "account_id": account.account_id,
@@ -128,6 +156,12 @@ class AccountWorker:
             "source_db_dir": str(account.source_db_dir),
         }
         try:
+            # Runtime resolution (including RB-003 source-provenance discovery) runs
+            # inside the account-scoped try so a fail-closed mismatch is recorded as
+            # this account's error and can never terminate the peer accounts' cycle.
+            account = resolve_runtime_account(account)
+            status["source_db_dir"] = str(account.source_db_dir)
+            self._assert_source_provenance(account)
             # These existing upstream modules require production image dependencies
             # such as pycryptodome.  Keep API-only consumers independent of a live
             # decrypt environment until a sync cycle is explicitly requested.
@@ -195,6 +229,10 @@ class AccountWorker:
                 status["runtime_health_error"] = str(
                     account.runtime.get("health_error") or "agent-wechat agent-server is unhealthy"
                 )
+        except SourceIdentityError as exc:
+            status["error"] = str(exc)
+            status["source_provenance"] = {"code": exc.code, "status": exc.status, **exc.details}
+            state = "error"
         except Exception as exc:  # Sync failures are account-scoped and must not stop peer accounts.
             status["error"] = str(exc)
             state = "error"

@@ -14,6 +14,7 @@ from typing import Any
 from memory.message_parse import message_display_parts
 
 from .registry import AccountConfig
+from .source_provenance import SourceIdentityError, valid_wxid, wechat_data_dir_name
 from .store import CoreStore, utc_now
 
 
@@ -283,6 +284,32 @@ def import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
 def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
     """Normalize the upstream per-account staging SQLite output into Core tables."""
     summary = {"chats": 0, "messages": 0, "message_changes": 0, "contacts": 0, "members": 0, "media": 0}
+    # RB-003 defense in depth: no business row may ever be projected from a
+    # source directory whose wxid disagrees with the fresh runtime identity,
+    # even if a caller bypasses the worker's pre-decrypt assertion.  Raising
+    # inside _import_account aborts the surrounding store transaction, so a
+    # rejected source can never leave partial writes behind.
+    observed_user = str(account.runtime.get("logged_in_user") or "").strip()
+    source_wxid = wechat_data_dir_name(account.source_db_dir)
+    if (
+        source_wxid
+        and valid_wxid(source_wxid)
+        and observed_user
+        and valid_wxid(observed_user)
+        and source_wxid != observed_user
+    ):
+        raise SourceIdentityError(
+            "source_identity_mismatch",
+            409,
+            f"source db directory identity {source_wxid!r} does not match fresh "
+            f"logged_in_user {observed_user!r} for account {account.account_id}",
+            details={
+                "account_id": account.account_id,
+                "selected_wxid": source_wxid,
+                "expected_wxid": observed_user,
+                "source_db_dir": str(account.source_db_dir),
+            },
+        )
     if not account.memory_db.exists():
         raise RuntimeError(f"staging memory database does not exist: {account.memory_db}")
     contact_db = account.decrypted_dir / "contact" / "contact.db"

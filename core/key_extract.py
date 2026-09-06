@@ -91,8 +91,25 @@ def import_agent_wechat_keys(
         for row in rows
         if str(row.get("account_dir") or "").strip()
     }
-    if account_dir and account_dir in available_accounts:
-        selected_account = account_dir
+    # RB-003: the key-export account_dir must equal the selected source
+    # account_dir.  Never borrow another (historical) account's credentials
+    # just because it happens to be the only stored one.
+    if account_dir:
+        if account_dir in available_accounts:
+            selected_account = account_dir
+        else:
+            return {
+                "account_id": account.account_id,
+                "returncode": 2,
+                "keys_file": str(account.keys_file),
+                "source_db_dir": str(account.source_db_dir),
+                "source": "agent_wechat_runtime_driver",
+                "account_dir": account_dir,
+                "error": (
+                    f"agent-wechat account_dir {account_dir!r} is not in stored credentials: "
+                    f"{sorted(available_accounts)}"
+                ),
+            }
     elif len(available_accounts) == 1:
         selected_account = next(iter(available_accounts))
     else:
