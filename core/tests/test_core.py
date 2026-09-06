@@ -106,7 +106,9 @@ class CoreHttpTest(unittest.TestCase):
                     "account_id": account_id,
                     "display_name": account_id.title(),
                     "runtime_dir": f"runtime/accounts/{account_id}",
-                    "runtime": {"display": ":1", "sender_enabled": True},
+                    # Identity v2: a persisted logged_in_user is the evidence
+                    # the migration uses to prove each account's identity.
+                    "runtime": {"display": ":1", "sender_enabled": True, "logged_in_user": f"wxid_{account_id}_0000"},
                 }
             )
         self.registry.source_path.write_text(

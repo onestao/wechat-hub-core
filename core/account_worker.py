@@ -11,6 +11,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from .identity import (
+    VERIFIED_SOURCE_AGENT_AUTH,
+    VERIFIED_SOURCE_RUNTIME_STATUS,
+    IdentityError,
+    valid_wxid,
+    wechat_data_dir_name,
+)
 from .normalize import import_account
 from .registry import AccountConfig, AccountRegistry
 from .runtime_bridge import resolve_runtime_account
@@ -49,7 +56,6 @@ class AccountWorker:
         self.store = store
 
     def run_account(self, account: AccountConfig, *, force_refresh: bool = False) -> dict[str, Any]:
-        account = resolve_runtime_account(account)
         started = time.monotonic()
         status: dict[str, Any] = {
             "account_id": account.account_id,
@@ -58,6 +64,55 @@ class AccountWorker:
             "source_db_dir": str(account.source_db_dir),
         }
         try:
+            account = resolve_runtime_account(account)
+            status["source_db_dir"] = str(account.source_db_dir)
+            # Sync Gate prerequisite (B5): observe the runtime-verified login
+            # BEFORE any ingest can write, so the binding state machine decides
+            # whether this cycle may write business data at all.
+            observed_user = str(account.runtime.get("logged_in_user") or "").strip()
+            if observed_user and valid_wxid(observed_user):
+                self.store.observe_login(
+                    account.account_id,
+                    observed_user,
+                    verified_source=(
+                        VERIFIED_SOURCE_AGENT_AUTH
+                        if account.runtime_provider == "agent_wechat"
+                        else VERIFIED_SOURCE_RUNTIME_STATUS
+                    ),
+                )
+
+            # Second provenance assertion (Taskbook RB-003):
+            # Assert wechat_data_dir_name(source_db_dir) == fresh logged_in_user
+            # and matches bound identity before extracting keys, decrypting, or importing.
+            source_wxid = wechat_data_dir_name(account.source_db_dir)
+            if source_wxid and valid_wxid(source_wxid):
+                if observed_user and valid_wxid(observed_user) and source_wxid != observed_user:
+                    raise IdentityError(
+                        "source_identity_mismatch",
+                        409,
+                        f"source db directory identity {source_wxid!r} does not match fresh logged_in_user {observed_user!r}",
+                        details={
+                            "account_id": account.account_id,
+                            "selected_wxid": source_wxid,
+                            "expected_wxid": observed_user,
+                            "source_db_dir": str(account.source_db_dir),
+                        },
+                    )
+                binding_info = self.store.binding_state(account.account_id)
+                bound_wxid = str((binding_info.get("identity") or {}).get("wechat_user_id") or "").strip()
+                if bound_wxid and valid_wxid(bound_wxid) and source_wxid != bound_wxid:
+                    raise IdentityError(
+                        "source_identity_mismatch",
+                        409,
+                        f"source db directory identity {source_wxid!r} does not match bound identity {bound_wxid!r}",
+                        details={
+                            "account_id": account.account_id,
+                            "selected_wxid": source_wxid,
+                            "bound_wxid": bound_wxid,
+                            "source_db_dir": str(account.source_db_dir),
+                        },
+                    )
+
             # These existing upstream modules require production image dependencies
             # such as pycryptodome.  Keep API-only consumers independent of a live
             # decrypt environment until a sync cycle is explicitly requested.
@@ -125,6 +180,20 @@ class AccountWorker:
                 status["runtime_health_error"] = str(
                     account.runtime.get("health_error") or "agent-wechat agent-server is unhealthy"
                 )
+        except IdentityError as exc:
+            # Sync Gate refusal (mismatch/unresolved): keep the cycle observable
+            # without writing business data (contract §3.2 rule 1).
+            status["error"] = str(exc)
+            status["identity_binding"] = {"code": exc.code, **exc.details}
+            state = "degraded"
+            try:
+                self.store.record_identity_event(
+                    account.account_id,
+                    "identity.sync_blocked",
+                    {"error": {"code": exc.code, "message": str(exc)}, "details": exc.details},
+                )
+            except Exception:  # observability must never mask the gate refusal
+                pass
         except Exception as exc:  # Sync failures are account-scoped and must not stop peer accounts.
             status["error"] = str(exc)
             state = "error"

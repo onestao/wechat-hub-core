@@ -14,8 +14,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from . import identity
+from .identity import IdentityError  # noqa: F401  (re-exported for app/worker)
+
 
 MAX_INLINE_MEDIA_BYTES = 20 * 1024 * 1024
+
+# Business tables that carry additive identity v2 ownership columns.
+IDENTITY_STAMPED_TABLES = ("chats", "contacts", "chat_members", "messages", "media", "events", "outbox")
 
 
 class StoreError(RuntimeError):
@@ -259,6 +265,57 @@ class CoreStore:
                     FOREIGN KEY (account_id, chat_id) REFERENCES chats(account_id, chat_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status, updated_at);
+
+                CREATE TABLE IF NOT EXISTS runtime_instances (
+                    instance_uuid TEXT PRIMARY KEY,
+                    runtime_alias TEXT NOT NULL UNIQUE,
+                    display_name TEXT NOT NULL,
+                    resource_key TEXT NOT NULL,
+                    runtime_provider TEXT NOT NULL DEFAULT 'agent_wechat',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS wechat_identities (
+                    wechat_identity_uuid TEXT PRIMARY KEY,
+                    wechat_user_id TEXT UNIQUE,
+                    nickname TEXT NOT NULL DEFAULT '',
+                    avatar_ref TEXT NOT NULL DEFAULT '',
+                    profile_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS instance_identity_bindings (
+                    binding_uuid TEXT PRIMARY KEY,
+                    instance_uuid TEXT NOT NULL,
+                    wechat_identity_uuid TEXT NOT NULL,
+                    bound_at TEXT NOT NULL,
+                    unbound_at TEXT,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    verified_source TEXT NOT NULL,
+                    FOREIGN KEY (instance_uuid) REFERENCES runtime_instances(instance_uuid),
+                    FOREIGN KEY (wechat_identity_uuid) REFERENCES wechat_identities(wechat_identity_uuid)
+                );
+                CREATE INDEX IF NOT EXISTS idx_bindings_instance_active ON instance_identity_bindings(instance_uuid, active);
+
+                CREATE TABLE IF NOT EXISTS instance_identity_observations (
+                    observation_uuid TEXT PRIMARY KEY,
+                    instance_uuid TEXT NOT NULL,
+                    observed_wechat_user_id TEXT NOT NULL DEFAULT '',
+                    resolved_state TEXT NOT NULL,
+                    verified_source TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_observations_instance ON instance_identity_observations(instance_uuid, created_at);
+
+                CREATE TABLE IF NOT EXISTS identity_backfills (
+                    account_id TEXT PRIMARY KEY,
+                    wechat_identity_uuid TEXT NOT NULL,
+                    evidence TEXT NOT NULL,
+                    migrated_at TEXT NOT NULL,
+                    FOREIGN KEY (wechat_identity_uuid) REFERENCES wechat_identities(wechat_identity_uuid)
+                );
                 """
             )
             outbox_columns = {row[1] for row in conn.execute("PRAGMA table_info(outbox)")}
@@ -277,6 +334,39 @@ class CoreStore:
                 WHERE source_local_id<>''
                 """
             )
+            self._migrate_identity_v2_columns(conn)
+
+    def _migrate_identity_v2_columns(self, conn: sqlite3.Connection) -> None:
+        """Additive identity v2 ownership columns on all business tables.
+
+        Contract §4.2: ``instance_uuid``/``wechat_identity_uuid`` default to ''
+        on legacy rows and are backfilled by ``migrate_identity_v2``; existing
+        tables are never rebuilt or renamed.
+        """
+        for table in IDENTITY_STAMPED_TABLES:
+            columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if "instance_uuid" not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN instance_uuid TEXT NOT NULL DEFAULT ''")
+            if "wechat_identity_uuid" not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN wechat_identity_uuid TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_messages_identity_chat
+            ON messages(wechat_identity_uuid, chat_id, created_at, message_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_chats_identity_updated
+            ON chats(wechat_identity_uuid, updated_at DESC, chat_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_contacts_identity_member
+            ON contacts(wechat_identity_uuid, member_id)
+            """
+        )
 
     @staticmethod
     def _message_migration_score(row: sqlite3.Row) -> tuple[int, int, int]:
@@ -388,14 +478,20 @@ class CoreStore:
     def _append_event(self, conn: sqlite3.Connection, account_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         occurred_at = utc_now()
         event_id = f"event-{uuid.uuid4().hex}"
+        instance_uuid, identity_uuid = identity.stamp_ref(conn, account_id)
         cursor = conn.execute(
-            "INSERT INTO events (event_id, account_id, event_type, occurred_at, payload_json) VALUES (?, ?, ?, ?, ?)",
-            (event_id, account_id, event_type, occurred_at, compact_json(payload)),
+            """
+            INSERT INTO events (event_id, account_id, instance_uuid, wechat_identity_uuid, event_type, occurred_at, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (event_id, account_id, instance_uuid, identity_uuid, event_type, occurred_at, compact_json(payload)),
         ).lastrowid
         return {
             "event_id": event_id,
             "cursor": str(cursor),
             "account_id": account_id,
+            "instance_uuid": instance_uuid,
+            "wechat_identity_uuid": identity_uuid,
             "event_type": event_type,
             "occurred_at": occurred_at,
             "payload": payload,
@@ -455,6 +551,86 @@ class CoreStore:
                 self._append_event(conn, account_id, "account.status", {"account": output})
         return output
 
+    # ------------------------------------------------------------------
+    # Identity v2 (instance / wechat identity / binding) — contract §3-§5
+
+    def binding_state(self, account_id: str) -> dict[str, Any]:
+        with self.connection() as conn:
+            instance = identity.instance_by_alias(conn, account_id)
+            if instance is None:
+                return {
+                    "state": identity.STATE_UNBOUND,
+                    "instance_uuid": "",
+                    "binding": None,
+                    "identity": None,
+                    "observation": None,
+                }
+            info = identity.binding_state(conn, instance["instance_uuid"], account_id)
+            info["instance_uuid"] = instance["instance_uuid"]
+            return info
+
+    def observe_login(
+        self,
+        account_id: str,
+        logged_in_user: str,
+        *,
+        verified_source: str,
+        display_name: str = "",
+        runtime_provider: str = "",
+    ) -> dict[str, Any]:
+        """Record a runtime-verified login observation and update binding state."""
+        with self.connection() as conn:
+            result = identity.observe_login(
+                conn,
+                account_id,
+                logged_in_user,
+                verified_source=verified_source,
+                display_name=display_name,
+                runtime_provider=runtime_provider,
+            )
+            if result["changed"]:
+                self._append_event(conn, account_id, "identity.binding_changed", {"binding": result})
+            return result
+
+    def confirm_switch(self, account_id: str, *, observed_wechat_user_id: str = "") -> dict[str, Any]:
+        """Operator-confirmed identity switch (contract §5.3)."""
+        with self.connection() as conn:
+            result = identity.confirm_switch(conn, account_id, observed_wxid=observed_wechat_user_id)
+            self._append_event(conn, account_id, "identity.binding_changed", {"switch": result})
+            return result
+
+    def migrate_identity_v2(
+        self,
+        accounts: list[dict[str, Any]],
+        *,
+        identity_map: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Idempotent legacy account → identity backfill (contract §4.2)."""
+        with self.connection() as conn:
+            return identity.migrate_legacy_accounts(conn, accounts, identity_map=identity_map)
+
+    def identity_view(self, account_id: str) -> dict[str, Any]:
+        with self.connection() as conn:
+            return identity.identity_view(conn, account_id)
+
+    def wechat_identity(self, wechat_identity_uuid: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return identity.identity_by_uuid(conn, wechat_identity_uuid)
+
+    def identity_send_gate(
+        self,
+        account_id: str,
+        *,
+        expected_wechat_identity_uuid: str = "",
+    ) -> dict[str, Any]:
+        """Send Gate for API intake and sender dispatch (contract §3.2 rule 2)."""
+        with self.connection() as conn:
+            return identity.send_gate(conn, account_id, expected_wechat_identity_uuid=expected_wechat_identity_uuid)
+
+    def record_identity_event(self, account_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.connection() as conn:
+            return self._append_event(conn, account_id, event_type, payload)
+
     def chat(self, account_id: str, chat_id: str) -> dict[str, Any] | None:
         with self.connection() as conn:
             row = conn.execute("SELECT * FROM chats WHERE account_id=? AND chat_id=?", (account_id, chat_id)).fetchone()
@@ -468,6 +644,10 @@ class CoreStore:
             "display_name": row["display_name"],
             "updated_at": row["updated_at"],
         }
+        if row["instance_uuid"]:
+            output["instance_uuid"] = row["instance_uuid"]
+        if row["wechat_identity_uuid"]:
+            output["wechat_identity_uuid"] = row["wechat_identity_uuid"]
         if row["alias"]:
             output["alias"] = row["alias"]
         if row["member_count"]:
@@ -477,7 +657,15 @@ class CoreStore:
             output["vendor_specific"] = vendor
         return output
 
-    def list_chats(self, account_id: str, *, cursor: str = "", limit: int = 100, query: str = "") -> dict[str, Any]:
+    def list_chats(
+        self,
+        account_id: str,
+        *,
+        cursor: str = "",
+        limit: int = 100,
+        query: str = "",
+        wechat_identity_uuid: str = "",
+    ) -> dict[str, Any]:
         limit = max(1, min(int(limit), 200))
         offset = 0
         if cursor:
@@ -488,6 +676,9 @@ class CoreStore:
                 raise StoreError("invalid_cursor", "cursor is not valid for this Core", details={"field": "cursor"})
         statement = "SELECT * FROM chats WHERE account_id=?"
         args: list[Any] = [account_id]
+        if wechat_identity_uuid:
+            statement += " AND wechat_identity_uuid=?"
+            args.append(str(wechat_identity_uuid))
         if query:
             statement += " AND (display_name LIKE ? OR alias LIKE ? OR chat_id LIKE ?)"
             marker = f"%{query}%"
@@ -506,30 +697,37 @@ class CoreStore:
     def upsert_chat(self, chat: dict[str, Any]) -> bool:
         account_id = str(chat["account_id"])
         chat_id = str(chat["chat_id"])
-        normalized = {
-            "account_id": account_id,
-            "chat_id": chat_id,
-            "type": str(chat.get("type") or "private"),
-            "display_name": str(chat.get("display_name") or chat_id),
-            "alias": str(chat.get("alias") or ""),
-            "member_count": max(0, int(chat.get("member_count") or 0)),
-            "updated_at": str(chat.get("updated_at") or utc_now()),
-            "vendor_specific": chat.get("vendor_specific") if isinstance(chat.get("vendor_specific"), dict) else {},
-        }
-        value_digest = digest({key: value for key, value in normalized.items() if key != "updated_at"})
         with self.connection() as conn:
+            gate = identity.sync_gate(conn, account_id)
+            instance_uuid = str(gate["instance"]["instance_uuid"])
+            identity_uuid = str(gate["stamp_identity"])
+            normalized = {
+                "account_id": account_id,
+                "chat_id": chat_id,
+                "type": str(chat.get("type") or "private"),
+                "display_name": str(chat.get("display_name") or chat_id),
+                "alias": str(chat.get("alias") or ""),
+                "member_count": max(0, int(chat.get("member_count") or 0)),
+                "updated_at": str(chat.get("updated_at") or utc_now()),
+                "vendor_specific": chat.get("vendor_specific") if isinstance(chat.get("vendor_specific"), dict) else {},
+            }
+            value_digest = digest(
+                {key: value for key, value in normalized.items() if key != "updated_at"}
+            )
             before = conn.execute("SELECT digest FROM chats WHERE account_id=? AND chat_id=?", (account_id, chat_id)).fetchone()
             conn.execute(
                 """
-                INSERT INTO chats (account_id, chat_id, type, display_name, alias, member_count, updated_at, vendor_json, digest)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chats (account_id, chat_id, instance_uuid, wechat_identity_uuid, type, display_name, alias, member_count, updated_at, vendor_json, digest)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, chat_id) DO UPDATE SET
                     type=excluded.type, display_name=excluded.display_name, alias=excluded.alias,
                     member_count=excluded.member_count, updated_at=excluded.updated_at,
-                    vendor_json=excluded.vendor_json, digest=excluded.digest
+                    vendor_json=excluded.vendor_json, digest=excluded.digest,
+                    instance_uuid=CASE WHEN chats.instance_uuid<>'' THEN chats.instance_uuid ELSE excluded.instance_uuid END,
+                    wechat_identity_uuid=CASE WHEN chats.wechat_identity_uuid<>'' THEN chats.wechat_identity_uuid ELSE excluded.wechat_identity_uuid END
                 """,
                 (
-                    account_id, chat_id, normalized["type"], normalized["display_name"], normalized["alias"],
+                    account_id, chat_id, instance_uuid, identity_uuid, normalized["type"], normalized["display_name"], normalized["alias"],
                     normalized["member_count"], normalized["updated_at"], compact_json(normalized["vendor_specific"]), value_digest,
                 ),
             )
@@ -559,15 +757,21 @@ class CoreStore:
             "remark": str(contact.get("remark") or ""),
         }
         with self.connection() as conn:
+            gate = identity.sync_gate(conn, account_id)
             conn.execute(
                 """
-                INSERT INTO contacts (account_id, member_id, display_name, alias, remark, updated_at, digest)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO contacts (account_id, member_id, instance_uuid, wechat_identity_uuid, display_name, alias, remark, updated_at, digest)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, member_id) DO UPDATE SET
                     display_name=excluded.display_name, alias=excluded.alias, remark=excluded.remark,
-                    updated_at=excluded.updated_at, digest=excluded.digest
+                    updated_at=excluded.updated_at, digest=excluded.digest,
+                    instance_uuid=CASE WHEN contacts.instance_uuid<>'' THEN contacts.instance_uuid ELSE excluded.instance_uuid END,
+                    wechat_identity_uuid=CASE WHEN contacts.wechat_identity_uuid<>'' THEN contacts.wechat_identity_uuid ELSE excluded.wechat_identity_uuid END
                 """,
-                (account_id, member_id, value["display_name"], value["alias"], value["remark"], utc_now(), digest(value)),
+                (
+                    account_id, member_id, str(gate["instance"]["instance_uuid"]), str(gate["stamp_identity"]),
+                    value["display_name"], value["alias"], value["remark"], utc_now(), digest(value),
+                ),
             )
 
     def upsert_member(self, account_id: str, chat_id: str, member: dict[str, Any]) -> None:
@@ -580,15 +784,21 @@ class CoreStore:
             "is_self": bool(member.get("is_self", False)),
         }
         with self.connection() as conn:
+            gate = identity.sync_gate(conn, account_id)
             conn.execute(
                 """
-                INSERT INTO chat_members (account_id, chat_id, member_id, display_name, alias, is_self, updated_at, digest)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chat_members (account_id, chat_id, member_id, instance_uuid, wechat_identity_uuid, display_name, alias, is_self, updated_at, digest)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, chat_id, member_id) DO UPDATE SET
                     display_name=excluded.display_name, alias=excluded.alias, is_self=excluded.is_self,
-                    updated_at=excluded.updated_at, digest=excluded.digest
+                    updated_at=excluded.updated_at, digest=excluded.digest,
+                    instance_uuid=CASE WHEN chat_members.instance_uuid<>'' THEN chat_members.instance_uuid ELSE excluded.instance_uuid END,
+                    wechat_identity_uuid=CASE WHEN chat_members.wechat_identity_uuid<>'' THEN chat_members.wechat_identity_uuid ELSE excluded.wechat_identity_uuid END
                 """,
-                (account_id, chat_id, member_id, value["display_name"], value["alias"], int(value["is_self"]), utc_now(), digest(value)),
+                (
+                    account_id, chat_id, member_id, str(gate["instance"]["instance_uuid"]), str(gate["stamp_identity"]),
+                    value["display_name"], value["alias"], int(value["is_self"]), utc_now(), digest(value),
+                ),
             )
 
     def member_count(self, account_id: str, chat_id: str) -> int:
@@ -622,6 +832,10 @@ class CoreStore:
             "created_at": row["created_at"],
             "author": parse_json(row["author_json"], {}),
         }
+        if row["instance_uuid"]:
+            output["instance_uuid"] = row["instance_uuid"]
+        if row["wechat_identity_uuid"]:
+            output["wechat_identity_uuid"] = row["wechat_identity_uuid"]
         optional = (("text", row["text"]), ("media_id", row["media_id"]), ("filename", row["filename"]), ("mime_type", row["mime_type"]), ("target_message_id", row["target_message_id"]))
         for key, value in optional:
             if value:
@@ -749,6 +963,9 @@ class CoreStore:
             value["source_local_id"] = str(source_local_id)
         value["source_message_table"] = str(value["vendor_specific"].get("source_message_table") or "")
         with self.connection() as conn:
+            gate = identity.sync_gate(conn, account_id)
+            instance_uuid = str(gate["instance"]["instance_uuid"])
+            identity_uuid = str(gate["stamp_identity"])
             if value["source_local_id"]:
                 canonical = conn.execute(
                     """
@@ -761,15 +978,18 @@ class CoreStore:
                 if canonical is not None:
                     value["message_id"] = str(canonical["message_id"])
                     message_id = value["message_id"]
-            value_digest = digest(value)
+            value_digest = digest(
+                {key: item for key, item in value.items() if key not in ("instance_uuid", "wechat_identity_uuid")}
+            )
             before = conn.execute("SELECT digest FROM messages WHERE account_id=? AND message_id=?", (account_id, message_id)).fetchone()
             conn.execute(
                 """
                 INSERT INTO messages (
-                    account_id, message_id, chat_id, source_local_id, source_message_table,
+                    account_id, message_id, chat_id, instance_uuid, wechat_identity_uuid,
+                    source_local_id, source_message_table,
                     type, direction, created_at, author_json, text, media_id,
                     filename, mime_type, target_message_id, substitutions_json, attributes_json, vendor_json, digest
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, message_id) DO UPDATE SET
                     chat_id=excluded.chat_id, source_local_id=excluded.source_local_id,
                     source_message_table=excluded.source_message_table,
@@ -777,10 +997,13 @@ class CoreStore:
                     author_json=excluded.author_json, text=excluded.text, media_id=excluded.media_id,
                     filename=excluded.filename, mime_type=excluded.mime_type, target_message_id=excluded.target_message_id,
                     substitutions_json=excluded.substitutions_json, attributes_json=excluded.attributes_json,
-                    vendor_json=excluded.vendor_json, digest=excluded.digest
+                    vendor_json=excluded.vendor_json, digest=excluded.digest,
+                    instance_uuid=CASE WHEN messages.instance_uuid<>'' THEN messages.instance_uuid ELSE excluded.instance_uuid END,
+                    wechat_identity_uuid=CASE WHEN messages.wechat_identity_uuid<>'' THEN messages.wechat_identity_uuid ELSE excluded.wechat_identity_uuid END
                 """,
                 (
-                    account_id, message_id, value["chat_id"], value["source_local_id"], value["source_message_table"],
+                    account_id, message_id, value["chat_id"], instance_uuid, identity_uuid,
+                    value["source_local_id"], value["source_message_table"],
                     value["type"], value["direction"], value["created_at"],
                     compact_json(author), value["text"], value["media_id"], value["filename"], value["mime_type"],
                     value["target_message_id"], compact_json(value["substitutions"]), compact_json(value["attributes"]),
@@ -812,16 +1035,22 @@ class CoreStore:
         }
         value_digest = digest(value)
         with self.connection() as conn:
+            gate = identity.sync_gate(conn, account_id)
             before = conn.execute("SELECT digest, status FROM media WHERE account_id=? AND media_id=?", (account_id, media_id)).fetchone()
             conn.execute(
                 """
-                INSERT INTO media (account_id, media_id, filename, mime_type, local_path, disposition, status, updated_at, digest)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO media (account_id, media_id, instance_uuid, wechat_identity_uuid, filename, mime_type, local_path, disposition, status, updated_at, digest)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, media_id) DO UPDATE SET
                     filename=excluded.filename, mime_type=excluded.mime_type, local_path=excluded.local_path,
-                    disposition=excluded.disposition, status=excluded.status, updated_at=excluded.updated_at, digest=excluded.digest
+                    disposition=excluded.disposition, status=excluded.status, updated_at=excluded.updated_at, digest=excluded.digest,
+                    instance_uuid=CASE WHEN media.instance_uuid<>'' THEN media.instance_uuid ELSE excluded.instance_uuid END,
+                    wechat_identity_uuid=CASE WHEN media.wechat_identity_uuid<>'' THEN media.wechat_identity_uuid ELSE excluded.wechat_identity_uuid END
                 """,
-                (account_id, media_id, value["filename"], value["mime_type"], value["local_path"], value["disposition"], value["status"], utc_now(), value_digest),
+                (
+                    account_id, media_id, str(gate["instance"]["instance_uuid"]), str(gate["stamp_identity"]),
+                    value["filename"], value["mime_type"], value["local_path"], value["disposition"], value["status"], utc_now(), value_digest,
+                ),
             )
             changed = before is None or before["digest"] != value_digest
             if changed and value["status"] == "ready":
@@ -832,6 +1061,168 @@ class CoreStore:
         with self.connection() as conn:
             row = conn.execute("SELECT * FROM media WHERE account_id=? AND media_id=?", (account_id, media_id)).fetchone()
         return dict(row) if row else None
+
+    # ------------------------------------------------------------------
+    # Identity-keyed data access (contract B8) — every business entity is
+    # queryable by wechat_identity_uuid; the account-scoped compat layer
+    # resolves the current binding and filters through it.
+
+    def list_messages(
+        self,
+        account_id: str,
+        chat_id: str,
+        *,
+        wechat_identity_uuid: str | None = None,
+        cursor: str = "",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Account-compat message listing with optional identity scoping.
+
+        ``wechat_identity_uuid=None`` disables identity filtering (used by the
+        legacy passthrough window); a concrete UUID scopes results to one
+        identity's data space.
+        """
+        limit = max(1, min(int(limit), 200))
+        offset = 0
+        if cursor:
+            try:
+                decoded = base64.urlsafe_b64decode(cursor.encode("ascii") + b"===").decode("ascii")
+                offset = max(0, int(decoded))
+            except (ValueError, UnicodeDecodeError):
+                raise StoreError("invalid_cursor", "cursor is not valid for this Core", details={"field": "cursor"})
+        statement = "SELECT * FROM messages WHERE account_id=? AND chat_id=?"
+        args: list[Any] = [account_id, chat_id]
+        if wechat_identity_uuid:
+            statement += " AND wechat_identity_uuid=?"
+            args.append(str(wechat_identity_uuid))
+        statement += " ORDER BY created_at ASC, message_id LIMIT ? OFFSET ?"
+        args.extend([limit + 1, offset])
+        with self.connection() as conn:
+            rows = conn.execute(statement, tuple(args)).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        next_cursor = ""
+        if has_more:
+            next_cursor = base64.urlsafe_b64encode(str(offset + len(rows)).encode("ascii")).decode("ascii").rstrip("=")
+        return {"account_id": account_id, "chat_id": chat_id, "messages": [self._message_row(row) for row in rows], "next_cursor": next_cursor}
+
+    def identity_list_chats(
+        self,
+        wechat_identity_uuid: str,
+        *,
+        cursor: str = "",
+        limit: int = 100,
+        query: str = "",
+    ) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 200))
+        offset = 0
+        if cursor:
+            try:
+                decoded = base64.urlsafe_b64decode(cursor.encode("ascii") + b"===").decode("ascii")
+                offset = max(0, int(decoded))
+            except (ValueError, UnicodeDecodeError):
+                raise StoreError("invalid_cursor", "cursor is not valid for this Core", details={"field": "cursor"})
+        statement = "SELECT * FROM chats WHERE wechat_identity_uuid=?"
+        args: list[Any] = [str(wechat_identity_uuid)]
+        if query:
+            statement += " AND (display_name LIKE ? OR alias LIKE ? OR chat_id LIKE ?)"
+            marker = f"%{query}%"
+            args.extend([marker, marker, marker])
+        statement += " ORDER BY updated_at DESC, chat_id LIMIT ? OFFSET ?"
+        args.extend([limit + 1, offset])
+        with self.connection() as conn:
+            rows = conn.execute(statement, tuple(args)).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        next_cursor = ""
+        if has_more:
+            next_cursor = base64.urlsafe_b64encode(str(offset + len(rows)).encode("ascii")).decode("ascii").rstrip("=")
+        return {"wechat_identity_uuid": str(wechat_identity_uuid), "chats": [self._chat_row(row) for row in rows], "next_cursor": next_cursor}
+
+    def identity_list_messages(
+        self,
+        wechat_identity_uuid: str,
+        *,
+        chat_id: str = "",
+        cursor: str = "",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 200))
+        offset = 0
+        if cursor:
+            try:
+                decoded = base64.urlsafe_b64decode(cursor.encode("ascii") + b"===").decode("ascii")
+                offset = max(0, int(decoded))
+            except (ValueError, UnicodeDecodeError):
+                raise StoreError("invalid_cursor", "cursor is not valid for this Core", details={"field": "cursor"})
+        statement = "SELECT * FROM messages WHERE wechat_identity_uuid=?"
+        args: list[Any] = [str(wechat_identity_uuid)]
+        if chat_id:
+            statement += " AND chat_id=?"
+            args.append(str(chat_id))
+        statement += " ORDER BY created_at ASC, message_id LIMIT ? OFFSET ?"
+        args.extend([limit + 1, offset])
+        with self.connection() as conn:
+            rows = conn.execute(statement, tuple(args)).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        next_cursor = ""
+        if has_more:
+            next_cursor = base64.urlsafe_b64encode(str(offset + len(rows)).encode("ascii")).decode("ascii").rstrip("=")
+        return {"wechat_identity_uuid": str(wechat_identity_uuid), "messages": [self._message_row(row) for row in rows], "next_cursor": next_cursor}
+
+    def identity_list_contacts(self, wechat_identity_uuid: str, *, limit: int = 200) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 500))
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM contacts WHERE wechat_identity_uuid=? ORDER BY display_name, member_id LIMIT ?",
+                (str(wechat_identity_uuid), limit),
+            ).fetchall()
+        contacts = [
+            {
+                "account_id": row["account_id"],
+                "member_id": row["member_id"],
+                "display_name": row["display_name"],
+                "alias": row["alias"],
+                "remark": row["remark"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+        return {"wechat_identity_uuid": str(wechat_identity_uuid), "contacts": contacts}
+
+    def identity_list_members(self, wechat_identity_uuid: str, chat_id: str) -> dict[str, Any]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM chat_members
+                WHERE wechat_identity_uuid=? AND chat_id=?
+                ORDER BY display_name, member_id
+                """,
+                (str(wechat_identity_uuid), str(chat_id)),
+            ).fetchall()
+        members = [
+            {
+                "account_id": row["account_id"],
+                "chat_id": row["chat_id"],
+                "member_id": row["member_id"],
+                "display_name": row["display_name"],
+                "alias": row["alias"],
+                "is_self": bool(row["is_self"]),
+            }
+            for row in rows
+        ]
+        return {"wechat_identity_uuid": str(wechat_identity_uuid), "chat_id": str(chat_id), "members": members}
+
+    def identity_list_media(self, wechat_identity_uuid: str, *, limit: int = 200) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 500))
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM media WHERE wechat_identity_uuid=? ORDER BY updated_at DESC, media_id LIMIT ?",
+                (str(wechat_identity_uuid), limit),
+            ).fetchall()
+        media = [dict(row) for row in rows]
+        return {"wechat_identity_uuid": str(wechat_identity_uuid), "media": media}
 
     def poll_events(self, *, after: str, limit: int, account_id: str = "") -> dict[str, Any]:
         try:
@@ -962,12 +1353,18 @@ class CoreStore:
                         request_digest=request_digest,
                     )
                     return self._receipt(previous)
+            # Send Gate (contract §3.2 rule 2): the authoritative identity check
+            # happens here so no queue path can bypass the API-level gate.
+            expected_identity = str(
+                payload.get("expected_wechat_identity_uuid") or payload.get("wechat_identity_uuid") or ""
+            ).strip()
+            gate = identity.send_gate(conn, account_id, expected_wechat_identity_uuid=expected_identity)
             send_id = f"send-{uuid.uuid4().hex}"
             inserted = conn.execute(
                 """
-                INSERT OR IGNORE INTO outbox (send_id, idempotency_key, kind, account_id, chat_id, status, client_request_id,
-                                    request_json, request_digest, accepted_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO outbox (send_id, idempotency_key, kind, account_id, chat_id, instance_uuid, wechat_identity_uuid,
+                                    status, client_request_id, request_json, request_digest, accepted_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?)
                 """,
                 (
                     send_id,
@@ -975,6 +1372,8 @@ class CoreStore:
                     kind,
                     account_id,
                     chat_id,
+                    str(gate["instance"]["instance_uuid"]),
+                    str(gate["stamp_identity"]),
                     str(payload.get("client_request_id") or ""),
                     compact_json(payload),
                     request_digest,

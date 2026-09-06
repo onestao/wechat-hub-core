@@ -18,7 +18,9 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import CONTRACT_VERSION
+from . import identity as identity_v2
 from .account_worker import AccountSyncLoop, AccountWorker
+from .identity import IdentityError
 from .registry import AccountRegistry, RegistryError, legacy_registry, load_registry
 from .runtime_control import RuntimeControlClient, RuntimeControlError
 from .sender import AccountSender, OutboxLoop, sender_capabilities
@@ -92,6 +94,12 @@ class CoreService:
             self._registry_fingerprint_value = self._registry_fingerprint()
 
     def apply_registry(self) -> None:
+        # Snapshot persisted runtime/sync metadata BEFORE the registry upsert
+        # refreshes runtime_json: the snapshot carries the strongest legacy
+        # backfill evidence (persisted logged_in_user) into the migration.
+        preloaded = {
+            str(row.get("account_id") or ""): row for row in self.store.list_accounts()
+        }
         for account in self.registry.all():
             existing = self.store.account(account.account_id)
             existing_runtime = (existing or {}).get("runtime") or {}
@@ -109,6 +117,65 @@ class CoreService:
                 runtime=runtime,
                 sync=(existing or {}).get("sync") or {},
             )
+        self.migrate_identity_v2(preloaded=preloaded)
+
+    def _operator_identity_map(self) -> dict[str, Any]:
+        """Operator-attested ``account_id -> wxid`` credential mapping.
+
+        Set via ``WECHAT_IDENTITY_MAP`` (JSON object) when a legacy deployment
+        can prove its WeChat identity through configuration that Core cannot
+        reach on its own.  Values are validated like every other evidence
+        source; display names and aliases are never accepted.
+        """
+        raw = os.environ.get("WECHAT_IDENTITY_MAP", "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def migrate_identity_v2(self, *, preloaded: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Idempotent identity v2 backfill for every registered account (B3)."""
+        preloaded = preloaded or {}
+        current_rows = {
+            str(row.get("account_id") or ""): row for row in self.store.list_accounts()
+        }
+        accounts_input: list[dict[str, Any]] = []
+        for config in self.registry.all():
+            stored = preloaded.get(config.account_id) or {}
+            fresh = current_rows.get(config.account_id) or {}
+            # Evidence merges the pre-upsert snapshot (persisted runtime
+            # metadata) with the just-refreshed row (registry-provided keys):
+            # whichever source last observed logged_in_user provides proof.
+            runtime = {**(stored.get("runtime") or {}), **(fresh.get("runtime") or {})}
+            sync = {**(stored.get("sync") or {}), **(fresh.get("sync") or {})}
+            data_dir_names: list[str] = []
+            for candidate in (
+                sync.get("source_db_dir"),
+                str(config.source_db_dir),
+                str(config.wechat_base_dir),
+            ):
+                name = identity_v2.wechat_data_dir_name(candidate)
+                if name and name not in data_dir_names:
+                    data_dir_names.append(name)
+            accounts_input.append(
+                {
+                    "account_id": config.account_id,
+                    "display_name": str(stored.get("display_name") or config.display_name),
+                    "runtime_provider": str(runtime.get("runtime_provider") or config.runtime_provider or "legacy"),
+                    "runtime": runtime,
+                    "sync": sync,
+                    "data_dir_names": data_dir_names,
+                }
+            )
+        try:
+            return self.store.migrate_identity_v2(accounts_input, identity_map=self._operator_identity_map())
+        except IdentityError:
+            raise
+        except StoreError as exc:  # pragma: no cover - migration is SQL-local
+            raise ApiError(exc.status, exc.code, str(exc), exc.details) from exc
 
     def accounts(self) -> list[dict[str, Any]]:
         # Keep the public account list fresh enough to surface a degraded
@@ -129,8 +196,33 @@ class CoreService:
         for config in self.registry.all():
             account = self.store.account(config.account_id)
             if account is not None:
-                output.append(account)
+                output.append(self.identity_enriched_account(account))
         return sorted(output, key=lambda item: str(item.get("account_id") or ""))
+
+    def identity_enriched_account(self, account: dict[str, Any]) -> dict[str, Any]:
+        """Extend a stored account row with the identity v2 status shape (B7)."""
+        output = dict(account)
+        runtime = account.get("runtime") or {}
+        try:
+            view = self.store.identity_view(str(account.get("account_id") or ""))
+        except (IdentityError, StoreError):  # pragma: no cover - defensive
+            view = {}
+        if view:
+            output.update(
+                {
+                    "instance_uuid": view["instance_uuid"],
+                    "runtime_alias": view["runtime_alias"],
+                    "resource_key": view["resource_key"],
+                    "runtime_provider": view["runtime_provider"]
+                    or str(runtime.get("runtime_provider") or "legacy"),
+                    "logged_in_user": str(runtime.get("logged_in_user") or ""),
+                    "observed_wechat_user_id": view["observed_wechat_user_id"],
+                    "wechat_identity_uuid": view["wechat_identity_uuid"],
+                    "identity_binding_state": view["identity_binding_state"],
+                    "wechat_profile": view["wechat_profile"],
+                }
+            )
+        return output
 
     def _registry_fingerprint(self) -> str:
         try:
@@ -236,6 +328,28 @@ class CoreService:
         for status in output.get("accounts") or []:
             if isinstance(status, dict):
                 self._apply_runtime_status(status)
+        # Enrich Runtime's own status entries with the identity v2 projection
+        # (contract §5.1) without altering the Runtime-side payload.
+        for status in output.get("accounts") or []:
+            if not isinstance(status, dict):
+                continue
+            account_id = str(status.get("account_id") or status.get("id") or "")
+            if not account_id or self.registry.get(account_id) is None:
+                continue
+            try:
+                view = self.store.identity_view(account_id)
+            except (IdentityError, StoreError):
+                continue
+            status.update(
+                {
+                    "instance_uuid": view["instance_uuid"],
+                    "runtime_alias": view["runtime_alias"],
+                    "resource_key": view["resource_key"],
+                    "wechat_identity_uuid": view["wechat_identity_uuid"],
+                    "identity_binding_state": view["identity_binding_state"],
+                    "wechat_profile": view["wechat_profile"],
+                }
+            )
         return output
 
     def _apply_runtime_status(self, status: dict[str, Any]) -> None:
@@ -300,6 +414,23 @@ class CoreService:
             runtime=runtime,
             sync=(existing or {}).get("sync") or {},
         )
+        observed_user = str(status.get("logged_in_user") or "").strip()
+        if observed_user and identity_v2.valid_wxid(observed_user):
+            # Runtime-verified login observation feeds the binding state
+            # machine (first bind / same identity / mismatch) before any sync
+            # or send can use this slot.
+            try:
+                self.store.observe_login(
+                    account_id,
+                    observed_user,
+                    verified_source=(
+                        identity_v2.VERIFIED_SOURCE_AGENT_AUTH
+                        if str(runtime.get("runtime_provider") or config.runtime_provider) == "agent_wechat"
+                        else identity_v2.VERIFIED_SOURCE_RUNTIME_STATUS
+                    ),
+                )
+            except IdentityError:
+                pass
 
     def create_runtime_account(self, payload: dict[str, Any]) -> dict[str, Any]:
         provider = str(payload.get("runtime_provider") or payload.get("provider") or "legacy").strip().lower()
@@ -448,6 +579,49 @@ class CoreService:
             raise ApiError(404, "account_not_found", f"Unknown account_id: {account_id}")
         return account
 
+    def identity_send_gate(
+        self,
+        account_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """API-intake Send Gate (B6): refuse before any media is accepted.
+
+        ``queue_send`` repeats the authoritative check so no queue path can
+        bypass it; this pass just converts the error into the contract §5.2
+        HTTP 409 shape early.
+        """
+        expected = str(
+            payload.get("expected_wechat_identity_uuid") or payload.get("wechat_identity_uuid") or ""
+        ).strip()
+        try:
+            return self.store.identity_send_gate(account_id, expected_wechat_identity_uuid=expected)
+        except IdentityError as exc:
+            raise ApiError(exc.status, exc.code, exc.message, exc.details) from exc
+
+    def confirm_identity_switch(self, account_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.require_account(account_id)
+        observed = str(
+            payload.get("observed_wechat_user_id") or payload.get("wechat_user_id") or ""
+        ).strip()
+        try:
+            return self.store.confirm_switch(account_id, observed_wechat_user_id=observed)
+        except IdentityError as exc:
+            raise ApiError(exc.status, exc.code, exc.message, exc.details) from exc
+
+    def identity_messages_view(self, account_id: str, chat_id: str) -> str:
+        """Resolve the identity UUID that scopes an account-compat message read.
+
+        Bound/unresolved slots are read strictly through their owning identity
+        so a confirmed switch hides the previous identity's history from the
+        account view; slots that never engaged the identity system keep the
+        unfiltered legacy read.
+        """
+        state = self.store.binding_state(account_id)
+        identity_record = state.get("identity")
+        if identity_record and state.get("state") in {"bound", "unresolved", "mismatch"}:
+            return str(identity_record.get("wechat_identity_uuid") or "")
+        return ""
+
     def require_chat(self, account_id: str, chat_id: str) -> dict[str, Any]:
         self.require_account(account_id)
         chat = self.store.chat(account_id, chat_id)
@@ -588,7 +762,7 @@ class CoreHandler(BaseHTTPRequestHandler):
                         return
             prefix = "/v1/accounts/"
             suffix = "/chats"
-            if path.startswith(prefix) and path.endswith(suffix):
+            if path.startswith(prefix) and path.endswith(suffix) and not path[len(prefix):-len(suffix)].strip("/").count("/"):
                 account_id = unquote(path[len(prefix):-len(suffix)].strip("/"))
                 self.service.require_account(account_id)
                 limit = bounded_int(query.get("limit", [""])[0], "limit", default=100, low=1, high=200)
@@ -598,10 +772,48 @@ class CoreHandler(BaseHTTPRequestHandler):
                         cursor=query.get("cursor", [""])[0],
                         limit=limit,
                         query=query.get("query", [""])[0].strip(),
+                        wechat_identity_uuid=query.get("wechat_identity_uuid", [""])[0].strip(),
                     )
                 except StoreError as exc:
                     raise ApiError(exc.status, exc.code, str(exc), exc.details) from exc
                 self._json(200, output)
+                return
+            if path.startswith(prefix):
+                rest = path[len(prefix):]
+                # GET /v1/accounts/{id} — identity v2 extended account shape (B7).
+                if rest and "/" not in rest:
+                    account = self.service.require_account(unquote(rest))
+                    self._json(200, self.service.identity_enriched_account(account))
+                    return
+                # GET /v1/accounts/{id}/chats/{chat_id}/messages — account-compat
+                # message listing scoped through the current binding (B8).
+                parts = rest.split("/")
+                if len(parts) == 4 and parts[1] == "chats" and parts[3] == "messages":
+                    account_id = unquote(parts[0])
+                    chat_id = unquote(parts[2])
+                    self.service.require_chat(account_id, chat_id)
+                    limit = bounded_int(query.get("limit", [""])[0], "limit", default=100, low=1, high=200)
+                    identity_filter = query.get("wechat_identity_uuid", [""])[0].strip()
+                    if not identity_filter:
+                        identity_filter = self.service.identity_messages_view(account_id, chat_id)
+                    try:
+                        output = self.service.store.list_messages(
+                            account_id,
+                            chat_id,
+                            wechat_identity_uuid=identity_filter or None,
+                            cursor=query.get("cursor", [""])[0],
+                            limit=limit,
+                        )
+                    except StoreError as exc:
+                        raise ApiError(exc.status, exc.code, str(exc), exc.details) from exc
+                    self._json(200, output)
+                    return
+            identity_prefix = "/v1/identities/"
+            if path.startswith(identity_prefix):
+                parts = path[len(identity_prefix):].split("/")
+                if len(parts) < 2 or not parts[0]:
+                    raise ApiError(404, "not_found", f"Unknown endpoint: {path}")
+                self._identity_query(unquote(parts[0]), "/".join(parts[1:]), query)
                 return
             if path == "/v1/events/poll":
                 account_id = query.get("account_id", [""])[0].strip()
@@ -647,6 +859,48 @@ class CoreHandler(BaseHTTPRequestHandler):
         except ApiError as error:
             self._error(error)
 
+    def _identity_query(self, wechat_identity_uuid: str, action: str, query: dict[str, list[str]]) -> None:
+        """Identity-keyed data access (B8): chats/messages/contacts/members/media."""
+        identity_record = self.service.store.wechat_identity(wechat_identity_uuid)
+        if identity_record is None:
+            raise ApiError(404, "identity_not_found", f"Unknown wechat_identity_uuid: {wechat_identity_uuid}")
+        limit = bounded_int(query.get("limit", [""])[0], "limit", default=100, low=1, high=500)
+        try:
+            if action == "chats":
+                output = self.service.store.identity_list_chats(
+                    wechat_identity_uuid,
+                    cursor=query.get("cursor", [""])[0],
+                    limit=limit,
+                    query=query.get("query", [""])[0].strip(),
+                )
+            elif action == "messages":
+                output = self.service.store.identity_list_messages(
+                    wechat_identity_uuid,
+                    chat_id=query.get("chat_id", [""])[0].strip(),
+                    cursor=query.get("cursor", [""])[0],
+                    limit=limit,
+                )
+            elif action == "contacts":
+                output = self.service.store.identity_list_contacts(wechat_identity_uuid, limit=limit)
+            elif action == "media":
+                output = self.service.store.identity_list_media(wechat_identity_uuid, limit=limit)
+            elif action.startswith("chats/") and action.endswith("/members"):
+                chat_id = unquote(action[len("chats/"):-len("/members")].strip("/"))
+                if not chat_id:
+                    raise ApiError(404, "not_found", f"Unknown endpoint: {action}")
+                output = self.service.store.identity_list_members(wechat_identity_uuid, chat_id)
+            else:
+                raise ApiError(404, "not_found", f"Unknown identity endpoint: {action}")
+        except StoreError as exc:
+            raise ApiError(exc.status, exc.code, str(exc), exc.details) from exc
+        output["identity"] = {
+            "wechat_identity_uuid": str(identity_record["wechat_identity_uuid"]),
+            "wechat_user_id": str(identity_record["wechat_user_id"] or ""),
+            "nickname": str(identity_record["nickname"] or ""),
+            "avatar_ref": str(identity_record["avatar_ref"] or ""),
+        }
+        self._json(200, output)
+
     def do_POST(self) -> None:  # noqa: N802
         try:
             path = urlparse(self.path).path.rstrip("/") or "/"
@@ -673,6 +927,9 @@ class CoreHandler(BaseHTTPRequestHandler):
                     if parts[1] == "login":
                         self._json(202, self.service.runtime_login_start(account_id))
                         return
+                    if parts[1] == "confirm-switch":
+                        self._json(200, self.service.confirm_identity_switch(account_id, payload))
+                        return
                     self._json(200, self.service.runtime_account_action(account_id, parts[1]))
                     return
             send_prefix = "/v1/send/"
@@ -684,6 +941,9 @@ class CoreHandler(BaseHTTPRequestHandler):
                 account_id = required_text(payload, "account_id")
                 chat_id = required_text(payload, "chat_id")
                 self.service.require_chat(account_id, chat_id)
+                # Send Gate (B6): reject identity conflicts with HTTP 409 before
+                # any media upload or queue side effect.
+                self.service.identity_send_gate(account_id, payload)
                 if len(idempotency_key) > 200:
                     raise ApiError(400, "invalid_request", "Idempotency-Key must be at most 200 characters", {"field": "Idempotency-Key"})
                 request_digest = self.service.store.send_request_digest(kind, payload)

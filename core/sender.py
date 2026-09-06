@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from .identity import IdentityError
 from .registry import AccountConfig, AccountRegistry
 from .runtime_bridge import resolve_runtime_account
 from .store import CoreStore, parse_json
@@ -571,6 +572,25 @@ class AccountSender:
                 account = self.registry.get(account_id)
                 if account is None or not account.sender_enabled:
                     result["deferred"] += 1
+                    continue
+                try:
+                    # Send Gate re-check at dispatch time (B6): the queue-time
+                    # binding may have changed (mismatch or confirmed switch).
+                    # A row whose intended identity no longer matches the slot
+                    # must fail closed instead of reaching upstream WeChat.
+                    self.store.identity_send_gate(
+                        account_id,
+                        expected_wechat_identity_uuid=str(row["wechat_identity_uuid"] or ""),
+                    )
+                except IdentityError as exc:
+                    self.store.transition_send(
+                        row["send_id"],
+                        "failed",
+                        details={"identity": {"code": exc.code, **dict(exc.details)}},
+                        error=str(exc),
+                        error_code=exc.code,
+                    )
+                    result["failed"] += 1
                     continue
                 with account_gui_lease(account_id) as gui_available:
                     if not gui_available:
