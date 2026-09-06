@@ -22,7 +22,7 @@ from .account_worker import AccountSyncLoop, AccountWorker
 from .registry import AccountRegistry, RegistryError, legacy_registry, load_registry
 from .runtime_control import RuntimeControlClient, RuntimeControlError
 from .sender import AccountSender, OutboxLoop, sender_capabilities
-from .store import CoreStore, StoreError, utc_now
+from .store import CoreStore, StoreError, stable_event_value, utc_now
 
 
 ACCOUNT_STATES = {"offline", "starting", "login_required", "online", "degraded", "stopped", "error"}
@@ -124,7 +124,14 @@ class CoreService:
                 runtime_list = {}
             for status in runtime_list.get("accounts") or []:
                 if isinstance(status, dict):
-                    self._apply_runtime_status(status)
+                    try:
+                        self._apply_runtime_status(status)
+                    except Exception:
+                        # Status refresh is best-effort polling: a locked or
+                        # hard-failing store must not turn GET /v1/accounts or
+                        # GET /health into a 500 storm, and must never reach
+                        # the background sync worker.
+                        continue
         output: list[dict[str, Any]] = []
         for config in self.registry.all():
             account = self.store.account(config.account_id)
@@ -146,6 +153,12 @@ class CoreService:
             "accounts": len(self.registry.all()),
             **self.last_registry_reload,
         }
+
+    def sync_worker_liveness_snapshot(self) -> dict[str, Any]:
+        liveness = getattr(self, "sync_worker_liveness", None)
+        if liveness is None:
+            return {}
+        return {"sync_worker": liveness.snapshot()}
 
     def reload_registry(self, *, force: bool = False) -> dict[str, Any]:
         with self._registry_reload_lock:
@@ -293,12 +306,26 @@ class CoreService:
         else:
             current_state = str((existing or {}).get("state") or "offline")
             state = current_state if current_state not in {"offline", "stopped"} else "starting"
+        projected = {
+            "account_id": account_id,
+            "display_name": str(status.get("display_name") or config.display_name),
+            "state": state,
+            "runtime": runtime,
+            "sync": (existing or {}).get("sync") or {},
+        }
+        if existing is not None and stable_event_value(existing) == stable_event_value(projected):
+            # Steady-state GET /health and GET /v1/accounts polling must not
+            # become a DB writer: every poll previously rewrote the identical
+            # row, contending with long import_account transactions for the
+            # single SQLite writer slot.  Skip unchanged projections; the API
+            # response below is unchanged.
+            return
         self.store.upsert_account(
             account_id,
-            str(status.get("display_name") or config.display_name),
+            projected["display_name"],
             state=state,
             runtime=runtime,
-            sync=(existing or {}).get("sync") or {},
+            sync=projected["sync"],
         )
 
     def create_runtime_account(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -550,6 +577,7 @@ class CoreHandler(BaseHTTPRequestHandler):
                         "sender_capabilities": sender_capabilities(),
                         "registry": self.service.registry_status(),
                         "runtime_management": self.service.runtime_management_status(),
+                        **self.service.sync_worker_liveness_snapshot(),
                     },
                 )
                 return
@@ -814,8 +842,13 @@ def main(argv: list[str] | None = None) -> int:
         registry_loop = RegistryReloadLoop(service, args.registry_reload_interval)
         registry_loop.start()
     if args.sync_interval > 0:
-        sync_loop = AccountSyncLoop(AccountWorker(registry, service.store), args.sync_interval)
+        sync_loop = AccountSyncLoop(
+            AccountWorker(registry, service.store),
+            args.sync_interval,
+            liveness_path=database.parent / "sync_liveness.json",
+        )
         sync_loop.start()
+        service.sync_worker_liveness = sync_loop.liveness
     if args.send_interval > 0:
         sender_loop = OutboxLoop(AccountSender(registry, service.store, root=workspace_root), args.send_interval)
         sender_loop.start()

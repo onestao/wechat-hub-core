@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,16 @@ from typing import Any, Iterable
 
 
 MAX_INLINE_MEDIA_BYTES = 20 * 1024 * 1024
+
+# Bounded extra patience on top of the per-connection busy_timeout for
+# idempotent account-status persistence.  A long writer (for example a
+# multi-minute import transaction) can exceed busy_timeout itself; these
+# delays give it a final chance to finish without any infinite busy loop.
+SQLITE_LOCK_RETRY_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0)
+
+
+def is_transient_sqlite_lock(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
 
 
 class StoreError(RuntimeError):
@@ -437,23 +448,35 @@ class CoreStore:
             "runtime": runtime or {},
             "sync": sync or {},
         }
-        with self.connection() as conn:
-            before = conn.execute("SELECT * FROM accounts WHERE account_id=?", (account_id,)).fetchone()
-            conn.execute(
-                """
-                INSERT INTO accounts (account_id, display_name, state, runtime_json, sync_json, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(account_id) DO UPDATE SET
-                    display_name=excluded.display_name, state=excluded.state,
-                    runtime_json=excluded.runtime_json, sync_json=excluded.sync_json,
-                    updated_at=excluded.updated_at
-                """,
-                (account_id, display_name, state, compact_json(output["runtime"]), compact_json(output["sync"]), now),
-            )
-            before_value = self._account_row(before) if before is not None else None
-            if before_value is None or stable_event_value(before_value) != stable_event_value(output):
-                self._append_event(conn, account_id, "account.status", {"account": output})
-        return output
+        # Account-status persistence is idempotent: a failed attempt rolls back
+        # its whole transaction and the retry rewrites the identical row, while
+        # event emission below is digest-guarded.  Only this idempotent path may
+        # retry on a transient SQLite lock; business-data writes never do.
+        for attempt, retry_delay in enumerate((0.0, *SQLITE_LOCK_RETRY_DELAYS)):
+            if retry_delay:
+                time.sleep(retry_delay)
+            try:
+                with self.connection() as conn:
+                    before = conn.execute("SELECT * FROM accounts WHERE account_id=?", (account_id,)).fetchone()
+                    conn.execute(
+                        """
+                        INSERT INTO accounts (account_id, display_name, state, runtime_json, sync_json, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(account_id) DO UPDATE SET
+                            display_name=excluded.display_name, state=excluded.state,
+                            runtime_json=excluded.runtime_json, sync_json=excluded.sync_json,
+                            updated_at=excluded.updated_at
+                        """,
+                        (account_id, display_name, state, compact_json(output["runtime"]), compact_json(output["sync"]), now),
+                    )
+                    before_value = self._account_row(before) if before is not None else None
+                    if before_value is None or stable_event_value(before_value) != stable_event_value(output):
+                        self._append_event(conn, account_id, "account.status", {"account": output})
+                return output
+            except sqlite3.OperationalError as exc:
+                if not is_transient_sqlite_lock(exc) or attempt >= len(SQLITE_LOCK_RETRY_DELAYS):
+                    raise
+        raise RuntimeError("unreachable: upsert_account retry loop must return or raise")  # pragma: no cover
 
     def chat(self, account_id: str, chat_id: str) -> dict[str, Any] | None:
         with self.connection() as conn:
