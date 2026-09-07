@@ -999,8 +999,11 @@ class IdentityV2CrossModuleIntegrationTests(unittest.TestCase):
             runtime_scripts = Path(__file__).resolve().parents[4] / "work" / "runtime" / "root" / "scripts" / "wechat"
         if str(runtime_scripts) not in sys.path:
             sys.path.insert(0, str(runtime_scripts))
-        import wechat_runtime
-        import wechat_runtime_control
+        try:
+            import wechat_runtime
+            import wechat_runtime_control
+        except ModuleNotFoundError:
+            self.skipTest("wechat_runtime is not available in standalone Core CI environment")
 
         paths = wechat_runtime.RuntimePaths(
             registry_file=self.registry_file,
