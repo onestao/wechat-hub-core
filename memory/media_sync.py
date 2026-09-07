@@ -53,6 +53,15 @@ def sqlite_ro(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def normalize_chat_username(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="strict")
+    return str(value)
+
+
+
 def aligned_aes_block_size(aes_size: int) -> int:
     if aes_size % 16:
         return aes_size + (16 - aes_size % 16)
@@ -315,7 +324,7 @@ def load_resource_map(resource_db: Path) -> dict[tuple[str, int], str]:
     for row in rows:
         md5 = extract_md5_from_packed_info(row["packed_info"])
         if md5:
-            out[(row["chat_username"], int(row["message_local_id"]))] = md5
+            out[(normalize_chat_username(row["chat_username"]), int(row["message_local_id"]))] = md5
     return out
 
 
@@ -348,8 +357,11 @@ def ensure_media_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def find_dat_files(wechat_base_dir: Path, chat_username: str, media_md5: str) -> list[Path]:
-    chat_hash = hashlib.md5(chat_username.encode()).hexdigest()
+def find_dat_files(wechat_base_dir: Path, chat_username: object, media_md5: str) -> list[Path]:
+    normalized_chat = normalize_chat_username(chat_username)
+    if not normalized_chat or not media_md5:
+        return []
+    chat_hash = hashlib.md5(normalized_chat.encode("utf-8")).hexdigest()
     attach_dir = wechat_base_dir / "msg" / "attach" / chat_hash
     if not attach_dir.exists():
         return []
@@ -474,8 +486,8 @@ def upsert_media(conn: sqlite3.Connection, item: dict, runtime_dir: Path) -> Non
     now = utc_now_iso()
     values = {
         "message_uid": item["message_uid"],
-        "chat_username": item["chat_username"],
-        "local_id": item["local_id"],
+        "chat_username": normalize_chat_username(item.get("chat_username")),
+        "local_id": int(item["local_id"]),
         "media_type": item["media_type"],
         "original_md5": item.get("original_md5"),
         "source_path": item.get("source_path"),
@@ -523,23 +535,25 @@ def upsert_media(conn: sqlite3.Connection, item: dict, runtime_dir: Path) -> Non
 
 
 def sync_image(row: sqlite3.Row, args, resource_map: dict[tuple[str, int], str], cfg: dict) -> dict:
-    media_md5 = resource_map.get((row["chat_username"], int(row["local_id"])))
+    chat_username = normalize_chat_username(row["chat_username"])
+    local_id = int(row["local_id"])
+    media_md5 = resource_map.get((chat_username, local_id))
     if not media_md5:
         return {
             "message_uid": row["message_uid"],
-            "chat_username": row["chat_username"],
-            "local_id": row["local_id"],
+            "chat_username": chat_username,
+            "local_id": local_id,
             "media_type": "image",
             "status": "missing_metadata",
             "error": "message_resource.db has no md5 for this image",
         }
-    dat_files = find_dat_files(args.wechat_base_dir, row["chat_username"], media_md5)
+    dat_files = find_dat_files(args.wechat_base_dir, chat_username, media_md5)
     selected = choose_dat(dat_files, prefer_thumb=args.prefer_thumbnails)
     if not selected:
         return {
             "message_uid": row["message_uid"],
-            "chat_username": row["chat_username"],
-            "local_id": row["local_id"],
+            "chat_username": chat_username,
+            "local_id": local_id,
             "media_type": "image",
             "original_md5": media_md5,
             "status": "missing_file",
@@ -549,8 +563,8 @@ def sync_image(row: sqlite3.Row, args, resource_map: dict[tuple[str, int], str],
     if not data or not fmt:
         return {
             "message_uid": row["message_uid"],
-            "chat_username": row["chat_username"],
-            "local_id": row["local_id"],
+            "chat_username": chat_username,
+            "local_id": local_id,
             "media_type": "image",
             "original_md5": media_md5,
             "source_path": str(selected),
@@ -563,8 +577,8 @@ def sync_image(row: sqlite3.Row, args, resource_map: dict[tuple[str, int], str],
     width, height = image_dimensions(data, fmt)
     return {
         "message_uid": row["message_uid"],
-        "chat_username": row["chat_username"],
-        "local_id": row["local_id"],
+        "chat_username": chat_username,
+        "local_id": local_id,
         "media_type": "image",
         "original_md5": media_md5,
         "source_path": str(selected),
@@ -580,10 +594,12 @@ def sync_image(row: sqlite3.Row, args, resource_map: dict[tuple[str, int], str],
 def sync_sticker(row: sqlite3.Row, args) -> dict:
     info = sticker_info(row["message_content"])
     media_md5 = info.get("md5")
+    chat_username = normalize_chat_username(row["chat_username"])
+    local_id = int(row["local_id"])
     base = {
         "message_uid": row["message_uid"],
-        "chat_username": row["chat_username"],
-        "local_id": row["local_id"],
+        "chat_username": chat_username,
+        "local_id": local_id,
         "media_type": "sticker",
         "original_md5": media_md5,
     }
@@ -643,11 +659,13 @@ def sync_sticker(row: sqlite3.Row, args) -> dict:
 
 
 def sync_video(row: sqlite3.Row, args, resource_map: dict[tuple[str, int], str]) -> dict:
-    media_md5 = resource_map.get((row["chat_username"], int(row["local_id"])))
+    chat_username = normalize_chat_username(row["chat_username"])
+    local_id = int(row["local_id"])
+    media_md5 = resource_map.get((chat_username, local_id))
     base = {
         "message_uid": row["message_uid"],
-        "chat_username": row["chat_username"],
-        "local_id": row["local_id"],
+        "chat_username": chat_username,
+        "local_id": local_id,
         "media_type": "video",
         "original_md5": media_md5,
     }
