@@ -249,6 +249,22 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def normalize_chat_username(value: object) -> str:
+    """Normalize SQLite-derived chat or user identifiers.
+
+    Enforces uniform fail-closed contract matching media_sync:
+    - str -> unchanged text
+    - int -> decimal string via str(value)
+    - bytes -> strict UTF-8 decode (UnicodeDecodeError on invalid bytes)
+    - None -> ""
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="strict")
+    return str(value)
+
+
 def open_readonly(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.execute("PRAGMA query_only=ON")
@@ -267,11 +283,14 @@ def load_name2id(message_db: Path) -> dict[str, str]:
     with open_readonly(message_db) as conn:
         if not table_exists(conn, "Name2Id"):
             return {}
-        return {
-            f"Msg_{hashlib.md5(username.encode()).hexdigest()}": username
-            for (username,) in conn.execute("SELECT user_name FROM Name2Id")
-            if username
-        }
+        name2id = {}
+        for (username,) in conn.execute("SELECT user_name FROM Name2Id"):
+            norm = normalize_chat_username(username)
+            if not norm:
+                continue
+            table_name = f"Msg_{hashlib.md5(norm.encode('utf-8')).hexdigest()}"
+            name2id[table_name] = norm
+        return name2id
 
 
 def load_contact_names(contact_db: Path | None) -> dict[str, dict[str, str]]:
@@ -288,10 +307,11 @@ def load_contact_names(contact_db: Path | None) -> dict[str, dict[str, str]]:
         ).fetchall()
     contacts = {}
     for username, remark, nick_name, alias, local_type in rows:
-        if not username:
+        norm_user = normalize_chat_username(username)
+        if not norm_user:
             continue
-        display_name = remark or nick_name or alias or username
-        contacts[username] = {
+        display_name = remark or nick_name or alias or norm_user
+        contacts[norm_user] = {
             "remark": remark or "",
             "nick_name": nick_name or "",
             "alias": alias or "",
@@ -317,10 +337,10 @@ def load_sessions(session_db: Path | None) -> dict[str, dict]:
         ).fetchall()
     sessions = {}
     for row in rows:
-        username = row[0]
-        if not username:
+        norm_user = normalize_chat_username(row[0])
+        if not norm_user:
             continue
-        sessions[username] = {
+        sessions[norm_user] = {
             "type": row[1],
             "unread_count": row[2],
             "is_hidden": row[3],
@@ -466,9 +486,10 @@ def ingest_chat(
     contacts: dict[str, dict[str, str]],
     sessions: dict[str, dict],
 ) -> int:
-    display_name = contacts.get(chat_username, {}).get("display_name") or chat_username or table_name
-    session = sessions.get(chat_username, {})
-    is_group = 1 if chat_username.endswith("@chatroom") else 0
+    norm_chat = normalize_chat_username(chat_username)
+    display_name = contacts.get(norm_chat, {}).get("display_name") or norm_chat or table_name
+    session = sessions.get(norm_chat, {})
+    is_group = 1 if norm_chat.endswith("@chatroom") else 0
     now = utc_now_iso()
 
     out_conn.execute(
@@ -489,7 +510,7 @@ def ingest_chat(
             updated_at=excluded.updated_at
         """,
         (
-            chat_username or table_name,
+            norm_chat or table_name,
             display_name,
             is_group,
             session.get("type"),
@@ -535,7 +556,7 @@ def ingest_chat(
             decoded_content = decompress_content(message_content, content_ct)
             decoded_compress = decompress_content(compress_content, None)
             base_type, app_subtype = split_msg_type(local_type)
-            identity = source_message_identity(chat_username, table_name, local_id)
+            identity = source_message_identity(norm_chat, table_name, local_id)
             existing = out_conn.execute(
                 "SELECT message_uid, content_sha256, packed_info_sha256 FROM messages WHERE source_identity=?",
                 (identity,),
@@ -625,9 +646,10 @@ def ingest_session_chats(
     inserted = 0
     now = utc_now_iso()
     for username, session in sessions.items():
-        if not username or username in discovered_usernames:
+        norm_user = normalize_chat_username(username)
+        if not norm_user or norm_user in discovered_usernames:
             continue
-        display_name = contacts.get(username, {}).get("display_name") or username
+        display_name = contacts.get(norm_user, {}).get("display_name") or norm_user
         out_conn.execute(
             """
             INSERT INTO chats (
@@ -644,9 +666,9 @@ def ingest_session_chats(
                 updated_at=excluded.updated_at
             """,
             (
-                username,
+                norm_user,
                 display_name,
-                1 if username.endswith("@chatroom") else 0,
+                1 if norm_user.endswith("@chatroom") else 0,
                 session.get("type"),
                 session.get("last_timestamp"),
                 session.get("sort_timestamp"),
