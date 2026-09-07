@@ -124,7 +124,8 @@ def parse_app_message(body: str | None) -> dict:
         result["quote"] = quote
         result["semantic_type"] = "quote"
         if quoted_content:
-            semantic_parts.append(f"引用 {quoted_sender or '对方'}: {quoted_content}")
+            quoted_sender_desc = quoted_sender or xml_node_text(refer, "chatusr") or ""
+            semantic_parts.append(f"引用 {quoted_sender_desc}: {quoted_content}" if quoted_sender_desc else f"引用: {quoted_content}")
 
     result["semantic_text"] = clean_text("；".join(part for part in semantic_parts if part))
     return result

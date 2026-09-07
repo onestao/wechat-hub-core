@@ -78,6 +78,18 @@ class AccountConfig:
     runtime: dict[str, Any] = field(default_factory=dict)
 
     @property
+    def instance_uuid(self) -> str:
+        return str(self.runtime.get("instance_uuid") or "").strip()
+
+    @property
+    def runtime_alias(self) -> str:
+        return str(self.runtime.get("runtime_alias") or self.account_id).strip()
+
+    @property
+    def resource_key(self) -> str:
+        return str(self.runtime.get("resource_key") or self.account_id).strip()
+
+    @property
     def display(self) -> str:
         return str(self.runtime.get("display") or ":1")
 
@@ -102,6 +114,12 @@ class AccountConfig:
         runtime["display"] = self.display
         if self.window_id:
             runtime["window_id"] = self.window_id
+        if self.instance_uuid:
+            runtime["instance_uuid"] = self.instance_uuid
+        if self.runtime_alias:
+            runtime["runtime_alias"] = self.runtime_alias
+        if self.resource_key:
+            runtime["resource_key"] = self.resource_key
         return runtime
 
 
@@ -139,9 +157,12 @@ def parse_account(item: object, *, root: Path) -> AccountConfig:
     if not ACCOUNT_ID_RE.fullmatch(account_id):
         raise RegistryError("account_id may contain only letters, digits, '_', '.' and '-'")
     display_name = _text(item.get("display_name"), "display_name") or account_id
-    runtime = item.get("runtime") or {}
-    if not isinstance(runtime, dict):
-        raise RegistryError(f"runtime for {account_id} must be an object")
+    runtime = dict(item.get("runtime") or {}) if isinstance(item.get("runtime"), dict) else {}
+    for key in ("instance_uuid", "runtime_alias", "resource_key"):
+        if key in item and key not in runtime:
+            val = _text(item.get(key), key)
+            if val:
+                runtime[key] = val
     account_root = _path(item.get("runtime_dir"), root=root, default=root / "runtime" / "accounts" / account_id)
     source_db_dir = _path(
         item.get("source_db_dir"), root=root, default=account_root / "unconfigured-source-db"
@@ -189,15 +210,22 @@ def parse_runtime_account(item: object, *, root: Path, registry_path: Path) -> A
     """Translate package A's stable registry record into a Core account."""
     if not isinstance(item, dict):
         raise RegistryError("each Runtime accounts entry must be an object")
-    account_id = _text(item.get("id"), "id", required=True)
+    account_id = _text(item.get("id") or item.get("account_id"), "id", required=True)
     if not ACCOUNT_ID_RE.fullmatch(account_id):
         raise RegistryError("Runtime account id may contain only letters, digits, '_', '.' and '-'")
+    instance_uuid = _text(item.get("instance_uuid"), "instance_uuid")
+    runtime_alias = _text(item.get("runtime_alias"), "runtime_alias") or account_id
+    resource_key = _text(item.get("resource_key"), "resource_key") or account_id
     display = _text(item.get("display"), "display") or ":1"
     provider = _text(item.get("runtime_provider"), "runtime_provider") or "legacy"
     if provider not in {"legacy", "agent_wechat"}:
         raise RegistryError(f"unsupported Runtime provider for {account_id}: {provider}")
     config_root = _runtime_config_root(registry_path)
-    home = _translate_runtime_home(_text(item.get("home"), "home", required=True), config_root=config_root)
+    raw_home = str(item.get("home") or "").strip()
+    if raw_home:
+        home = _translate_runtime_home(raw_home, config_root=config_root)
+    else:
+        home = config_root / "agent-wechat" / resource_key / "home"
     unresolved_base = home / "Documents" / "xwechat_files" / "__runtime_unresolved__"
     runtime: dict[str, Any] = {
         "runtime_bridge": "agent-wechat-v1" if provider == "agent_wechat" else "wechat-selkies-v1",
@@ -208,11 +236,16 @@ def parse_runtime_account(item: object, *, root: Path, registry_path: Path) -> A
         "enabled": bool(item.get("enabled", True)),
         "sender_enabled": bool(item.get("enabled", True)),
         "source_home": str(home),
+        "instance_uuid": instance_uuid,
+        "runtime_alias": runtime_alias,
+        "resource_key": resource_key,
     }
+    if item.get("logged_in_user"):
+        runtime["logged_in_user"] = str(item["logged_in_user"]).strip()
     if provider == "agent_wechat":
         agent_wechat = item.get("agent_wechat") if isinstance(item.get("agent_wechat"), dict) else {}
-        container_name = _text(agent_wechat.get("container_name"), "agent_wechat.container_name", required=True)
-        token_file = _text(agent_wechat.get("token_file"), "agent_wechat.token_file", required=True)
+        container_name = _text(agent_wechat.get("container_name"), "agent_wechat.container_name") or f"wechat-agent-{resource_key}"
+        token_file = _text(agent_wechat.get("token_file"), "agent_wechat.token_file") or f"/config/agent-wechat/{resource_key}/auth-token"
         runtime.update(
             {
                 "sender_driver": "agent_wechat",
@@ -259,7 +292,8 @@ def load_registry(path: Path, *, root: Path) -> AccountRegistry:
     if not isinstance(entries, list):
         raise RegistryError("registry must be an object containing an accounts array")
     runtime_shape = bool(entries) and all(
-        isinstance(item, dict) and "id" in item and "account_id" not in item
+        isinstance(item, dict)
+        and ("home" in item or "runtime_provider" in item or ("id" in item and "source_db_dir" not in item))
         for item in entries
     )
     if runtime_shape:
