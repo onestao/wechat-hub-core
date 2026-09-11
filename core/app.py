@@ -34,7 +34,7 @@ from .identity import IdentityError
 from .registry import AccountRegistry, RegistryError, legacy_registry, load_registry
 from .runtime_control import RuntimeControlClient, RuntimeControlError
 from .sender import AccountSender, OutboxLoop, sender_capabilities
-from .store import CoreStore, StoreError, parse_rfc3339, stable_event_value, utc_now
+from .store import CoreStore, StoreError, account_status_event_semantic, parse_rfc3339, stable_event_value, utc_now
 
 
 ACCOUNT_STATES = {"offline", "starting", "login_required", "online", "degraded", "stopped", "error"}
@@ -522,7 +522,7 @@ class CoreService:
             "runtime": runtime,
             "sync": (existing or {}).get("sync") or {},
         }
-        if existing is not None and stable_event_value(existing) == stable_event_value(projected):
+        if existing is not None and account_status_event_semantic(existing) == account_status_event_semantic(projected):
             # Steady-state GET /health and GET /v1/accounts polling must not
             # become a DB writer: every poll previously rewrote the identical
             # row, contending with long import_account transactions for the
@@ -1059,6 +1059,15 @@ class CoreHandler(BaseHTTPRequestHandler):
                         self._json(200, page)
                         return
                     time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+            if path == "/v1/events/checkpoint":
+                consumer_id = query.get("consumer_id", [""])[0].strip()
+                if not consumer_id:
+                    raise ApiError(400, "invalid_request", "consumer_id query parameter is required", {"field": "consumer_id"})
+                output = self.service.store.get_checkpoint(consumer_id)
+                if output is None:
+                    raise ApiError(404, "checkpoint_not_found", f"No checkpoint found for consumer {consumer_id}")
+                self._json(200, output)
+                return
             avatar_prefix = "/v1/avatar/"
             if path.startswith(avatar_prefix) or path.startswith("/api/avatar/"):
                 prefix = avatar_prefix if path.startswith(avatar_prefix) else "/api/avatar/"
@@ -1178,6 +1187,28 @@ class CoreHandler(BaseHTTPRequestHandler):
                     raise ApiError(400, "invalid_event_ids", "event_ids must be a non-empty list of strings", {"field": "event_ids"})
                 try:
                     output = self.service.store.ack_events(required_text(payload, "consumer_id"), event_ids)
+                except StoreError as exc:
+                    raise ApiError(exc.status, exc.code, str(exc), exc.details) from exc
+                self._json(200, output)
+                return
+            if path == "/v1/events/checkpoint":
+                consumer_id = required_text(payload, "consumer_id")
+                raw_cursor = payload.get("processed_through_cursor")
+                if raw_cursor is None:
+                    raise ApiError(400, "invalid_cursor", "processed_through_cursor is required", {"field": "processed_through_cursor"})
+                try:
+                    cursor_val = int(raw_cursor)
+                except (ValueError, TypeError) as exc:
+                    raise ApiError(400, "invalid_cursor", "processed_through_cursor must be an integer", {"field": "processed_through_cursor"}) from exc
+                last_event_id = str(payload.get("last_event_id") or "").strip()
+                subscription_account_id = str(payload.get("subscription_account_id") or "").strip()
+                try:
+                    output = self.service.store.checkpoint_consumer(
+                        consumer_id,
+                        cursor_val,
+                        last_event_id=last_event_id,
+                        subscription_account_id=subscription_account_id,
+                    )
                 except StoreError as exc:
                     raise ApiError(exc.status, exc.code, str(exc), exc.details) from exc
                 self._json(200, output)

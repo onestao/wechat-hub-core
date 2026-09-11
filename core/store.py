@@ -79,13 +79,81 @@ def digest(value: Any) -> str:
     return hashlib.sha256(compact_json(value).encode("utf-8")).hexdigest()
 
 
+def account_status_event_semantic(account: Any) -> dict[str, Any]:
+    """Extract deterministic semantic projection for account status event deduplication."""
+    if not isinstance(account, dict):
+        return {}
+
+    top = {
+        "account_id": str(account.get("account_id") or "").strip(),
+        "display_name": str(account.get("display_name") or "").strip(),
+        "state": str(account.get("state") or "").strip(),
+    }
+
+    raw_runtime = account.get("runtime") if isinstance(account.get("runtime"), dict) else {}
+    runtime_semantic: dict[str, Any] = {}
+    runtime_allowlist = (
+        "runtime_provider",
+        "container_state",
+        "status",
+        "running",
+        "wechat_state",
+        "logged_in",
+        "login_status",
+        "logged_in_user",
+        "username",
+        "health",
+        "available",
+        "ready",
+        "sender_enabled",
+        "sender_driver",
+        "error_code",
+        "error_class",
+        "error",
+        "registered",
+        "display",
+    )
+    for key in runtime_allowlist:
+        if key in raw_runtime:
+            runtime_semantic[key] = raw_runtime[key]
+
+    raw_sync = account.get("sync") if isinstance(account.get("sync"), dict) else {}
+    sync_semantic: dict[str, Any] = {}
+    sync_allowlist = (
+        "enabled",
+        "ok",
+        "stale",
+        "degraded",
+        "status",
+        "health",
+        "error_code",
+        "error_class",
+        "error",
+    )
+    for key in sync_allowlist:
+        if key in raw_sync:
+            sync_semantic[key] = raw_sync[key]
+
+    return {
+        "top": top,
+        "runtime": runtime_semantic,
+        "sync": sync_semantic,
+    }
+
+
 def stable_event_value(value: Any) -> Any:
-    """Remove per-run timing fields before comparing account status events."""
+    """Backward-compatible helper delegating to account_status_event_semantic if dict has account shape."""
+    if isinstance(value, dict) and ("account_id" in value or "state" in value or "runtime" in value or "sync" in value):
+        return account_status_event_semantic(value)
     if isinstance(value, dict):
         return {
             key: stable_event_value(item)
             for key, item in value.items()
-            if key not in {"started_at", "finished_at", "elapsed_seconds"}
+            if key not in {
+                "started_at", "finished_at", "elapsed_seconds", "elapsed_ms",
+                "last_run_at", "last_completed_cycle_at", "last_clean_cycle_at",
+                "cycle_count", "updated_at",
+            }
         }
     if isinstance(value, list):
         return [stable_event_value(item) for item in value]
@@ -304,6 +372,15 @@ class CoreStore:
                     acknowledged_at TEXT NOT NULL,
                     PRIMARY KEY (consumer_id, event_id),
                     FOREIGN KEY (event_id) REFERENCES events(event_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_event_acks_event_id ON event_acks(event_id);
+
+                CREATE TABLE IF NOT EXISTS consumer_checkpoints (
+                    consumer_id TEXT PRIMARY KEY,
+                    processed_through_cursor INTEGER NOT NULL,
+                    last_event_id TEXT NOT NULL DEFAULT '',
+                    subscription_account_id TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS outbox (
@@ -634,7 +711,7 @@ class CoreStore:
                         (account_id, display_name, state, compact_json(output["runtime"]), compact_json(output["sync"]), now),
                     )
                     before_value = self._account_row(before) if before is not None else None
-                    if before_value is None or stable_event_value(before_value) != stable_event_value(output):
+                    if before_value is None or account_status_event_semantic(before_value) != account_status_event_semantic(output):
                         self._append_event(conn, account_id, "account.status", {"account": output})
                 return output
             except sqlite3.OperationalError as exc:
@@ -1619,15 +1696,20 @@ class CoreStore:
         if cursor < 0:
             raise StoreError("invalid_cursor", "after must not be negative", details={"field": "after"})
         limit = max(1, min(int(limit), 200))
-        statement = "SELECT * FROM events WHERE cursor>?"
-        args: list[Any] = [cursor]
-        if account_id:
-            statement += " AND account_id=?"
-            args.append(account_id)
-        statement += " ORDER BY cursor ASC LIMIT ?"
-        args.append(limit + 1)
         with self.connection() as conn:
+            head_row = conn.execute("SELECT COALESCE(MAX(cursor), 0), COALESCE(MIN(cursor), 0) FROM events").fetchone()
+            stream_head_cursor = int(head_row[0] or 0)
+            retention_floor_cursor = int(head_row[1] or 0)
+
+            statement = "SELECT * FROM events WHERE cursor>? AND cursor<=?"
+            args: list[Any] = [cursor, stream_head_cursor]
+            if account_id:
+                statement += " AND account_id=?"
+                args.append(account_id)
+            statement += " ORDER BY cursor ASC LIMIT ?"
+            args.append(limit + 1)
             rows = conn.execute(statement, tuple(args)).fetchall()
+
         has_more = len(rows) > limit
         selected = rows[:limit]
         events = [
@@ -1638,7 +1720,13 @@ class CoreStore:
             }
             for row in selected
         ]
-        return {"events": events, "next_cursor": events[-1]["cursor"] if events else str(cursor), "has_more": has_more}
+        return {
+            "events": events,
+            "next_cursor": events[-1]["cursor"] if events else str(cursor),
+            "has_more": has_more,
+            "stream_head_cursor": stream_head_cursor,
+            "retention_floor_cursor": retention_floor_cursor,
+        }
 
     def ack_events(self, consumer_id: str, event_ids: Iterable[str]) -> dict[str, Any]:
         event_ids = [str(item).strip() for item in event_ids if str(item).strip()]
@@ -1658,6 +1746,127 @@ class CoreStore:
                 [(consumer_id, event_id, now) for event_id in event_ids],
             )
         return {"consumer_id": consumer_id, "acked_event_ids": event_ids, "acked_count": len(event_ids)}
+
+    def checkpoint_consumer(
+        self,
+        consumer_id: str,
+        processed_through_cursor: int,
+        *,
+        last_event_id: str = "",
+        subscription_account_id: str = "",
+    ) -> dict[str, Any]:
+        cid = str(consumer_id or "").strip()
+        if not cid:
+            raise StoreError("invalid_request", "consumer_id must be a non-empty string", details={"field": "consumer_id"})
+        try:
+            cursor_val = int(processed_through_cursor)
+        except (ValueError, TypeError) as exc:
+            raise StoreError("invalid_cursor", "processed_through_cursor must be an integer", details={"field": "processed_through_cursor"}) from exc
+        if cursor_val < 0:
+            raise StoreError("invalid_cursor", "processed_through_cursor must not be negative", details={"field": "processed_through_cursor"})
+
+        last_event_id = str(last_event_id or "").strip()
+        subscription_account_id = str(subscription_account_id or "").strip()
+        now = utc_now()
+
+        with self.connection() as conn:
+            head_row = conn.execute("SELECT COALESCE(MAX(cursor), 0), COALESCE(MIN(cursor), 0) FROM events").fetchone()
+            stream_head = int(head_row[0] or 0)
+            retention_floor = int(head_row[1] or 0)
+
+            if cursor_val > stream_head:
+                raise StoreError(
+                    "cursor_exceeds_head",
+                    f"processed_through_cursor ({cursor_val}) cannot exceed current stream head ({stream_head})",
+                    status=400,
+                    details={"processed_through_cursor": cursor_val, "stream_head_cursor": stream_head},
+                )
+
+            existing = conn.execute(
+                "SELECT processed_through_cursor, last_event_id, subscription_account_id FROM consumer_checkpoints WHERE consumer_id=?",
+                (cid,),
+            ).fetchone()
+
+            if existing is not None:
+                prev_cursor = int(existing["processed_through_cursor"])
+                if cursor_val < prev_cursor:
+                    raise StoreError(
+                        "cursor_regression",
+                        f"processed_through_cursor cannot move backward from {prev_cursor} to {cursor_val}",
+                        status=400,
+                        details={"current_cursor": prev_cursor, "requested_cursor": cursor_val},
+                    )
+                if cursor_val == prev_cursor and (not last_event_id or last_event_id == existing["last_event_id"]):
+                    return {
+                        "ok": True,
+                        "consumer_id": cid,
+                        "processed_through_cursor": cursor_val,
+                        "stream_head_cursor": stream_head,
+                        "retention_floor_cursor": retention_floor,
+                        "idempotent": True,
+                    }
+
+            if last_event_id:
+                ev_row = conn.execute("SELECT cursor FROM events WHERE event_id=?", (last_event_id,)).fetchone()
+                if ev_row is not None:
+                    ev_cursor = int(ev_row["cursor"])
+                    if ev_cursor > cursor_val:
+                        raise StoreError(
+                            "invalid_event_id",
+                            f"last_event_id cursor ({ev_cursor}) exceeds reported processed_through_cursor ({cursor_val})",
+                            status=400,
+                            details={"last_event_id": last_event_id, "event_cursor": ev_cursor, "cursor": cursor_val},
+                        )
+                else:
+                    if stream_head > 0 and cursor_val >= retention_floor:
+                        raise StoreError(
+                            "event_not_found",
+                            f"last_event_id {last_event_id} not found in events table",
+                            status=404,
+                            details={"last_event_id": last_event_id},
+                        )
+
+            conn.execute(
+                """
+                INSERT INTO consumer_checkpoints (
+                    consumer_id, processed_through_cursor, last_event_id, subscription_account_id, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(consumer_id) DO UPDATE SET
+                    processed_through_cursor=excluded.processed_through_cursor,
+                    last_event_id=excluded.last_event_id,
+                    subscription_account_id=excluded.subscription_account_id,
+                    updated_at=excluded.updated_at
+                """,
+                (cid, cursor_val, last_event_id, subscription_account_id, now),
+            )
+
+        return {
+            "ok": True,
+            "consumer_id": cid,
+            "processed_through_cursor": cursor_val,
+            "stream_head_cursor": stream_head,
+            "retention_floor_cursor": retention_floor,
+            "idempotent": False,
+        }
+
+    def get_checkpoint(self, consumer_id: str) -> dict[str, Any] | None:
+        cid = str(consumer_id or "").strip()
+        if not cid:
+            return None
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM consumer_checkpoints WHERE consumer_id=?",
+                (cid,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "consumer_id": row["consumer_id"],
+            "processed_through_cursor": int(row["processed_through_cursor"]),
+            "last_event_id": str(row["last_event_id"] or ""),
+            "subscription_account_id": str(row["subscription_account_id"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+        }
 
     def put_inline_media(
         self, account_id: str, content_base64: str, *, filename: str, mime_type: str, media_root: Path
