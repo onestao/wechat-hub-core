@@ -79,6 +79,18 @@ def digest(value: Any) -> str:
     return hashlib.sha256(compact_json(value).encode("utf-8")).hexdigest()
 
 
+def _normalize_semantic_value(val: Any) -> Any:
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val
+    if isinstance(val, str):
+        return val.strip()
+    return val
+
+
 def account_status_event_semantic(account: Any) -> dict[str, Any]:
     """Extract deterministic semantic projection for account status event deduplication."""
     if not isinstance(account, dict):
@@ -115,7 +127,9 @@ def account_status_event_semantic(account: Any) -> dict[str, Any]:
     )
     for key in runtime_allowlist:
         if key in raw_runtime:
-            runtime_semantic[key] = raw_runtime[key]
+            norm = _normalize_semantic_value(raw_runtime[key])
+            if norm != "":
+                runtime_semantic[key] = norm
 
     raw_sync = account.get("sync") if isinstance(account.get("sync"), dict) else {}
     sync_semantic: dict[str, Any] = {}
@@ -132,7 +146,9 @@ def account_status_event_semantic(account: Any) -> dict[str, Any]:
     )
     for key in sync_allowlist:
         if key in raw_sync:
-            sync_semantic[key] = raw_sync[key]
+            norm = _normalize_semantic_value(raw_sync[key])
+            if norm != "":
+                sync_semantic[key] = norm
 
     return {
         "top": top,

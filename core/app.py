@@ -456,43 +456,8 @@ class CoreService:
             )
 
         existing = self.store.account(account_id)
-        runtime = config.public_runtime()
-        if instance_uuid:
-            runtime["instance_uuid"] = instance_uuid
-        if runtime_alias:
-            runtime["runtime_alias"] = runtime_alias
-        if resource_key:
-            runtime["resource_key"] = resource_key
-        runtime["registered"] = True
-        runtime.update(
-            {
-                "running": bool(status.get("running")),
-                "container_running": bool(status.get("container_running", status.get("running"))),
-                "agent_server_healthy": status.get("agent_server_healthy"),
-                "runtime_health": status.get("runtime_health"),
-                "health_error": status.get("health_error"),
-                "wechat_login_status": status.get("wechat_login_status"),
-                "logged_in_user": status.get("logged_in_user"),
-                "pids": list(status.get("pids") or []),
-                "windows": list(status.get("windows") or []),
-                "window_error": status.get("window_error"),
-                "username": status.get("username") or runtime.get("username"),
-                "uid": status.get("uid", runtime.get("uid")),
-                "home": status.get("home") or runtime.get("source_home"),
-                "autostart": bool(status.get("autostart", True)),
-            }
-        )
-        for key in (
-            "runtime_provider",
-            "container_name",
-            "container_id",
-            "image",
-            "current_image",
-            "image_update_pending",
-            "capabilities",
-        ):
-            if key in status:
-                runtime[key] = status[key]
+        from .runtime_bridge import canonical_runtime_projection
+        runtime = canonical_runtime_projection(config, status)
         if not runtime["running"]:
             state = "stopped"
         elif str(runtime.get("runtime_provider") or config.runtime_provider) == "agent_wechat" and status.get("agent_server_healthy") is False:
@@ -501,7 +466,7 @@ class CoreService:
             login_status = str(status.get("wechat_login_status") or "unknown")
             if login_status == "logged_in":
                 existing_sync = (existing or {}).get("sync") or {}
-                if existing_sync.get("ok") is False or (existing or {}).get("state") == "degraded":
+                if existing_sync.get("ok") is False:
                     state = "degraded"
                 else:
                     state = "online"

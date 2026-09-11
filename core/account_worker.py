@@ -214,10 +214,9 @@ class AccountWorker:
             "source_db_dir": str(account.source_db_dir),
         }
         try:
-            # Runtime resolution (including RB-003 source-provenance discovery) runs
-            # inside the account-scoped try so a fail-closed mismatch is recorded as
-            # this account's error and can never terminate the peer accounts' cycle.
-            account = resolve_runtime_account(account)
+            binding_info = self.store.binding_state(account.account_id)
+            bound_wxid = str((binding_info.get("identity") or {}).get("wechat_user_id") or "").strip()
+            account = resolve_runtime_account(account, bound_wxid=bound_wxid)
             status["source_db_dir"] = str(account.source_db_dir)
             self._assert_source_provenance(account)
 
@@ -418,6 +417,10 @@ class AccountWorker:
         if self.registry.get(account.account_id) is None:
             status["deregistered_during_sync"] = True
             return status
+        if not account.runtime.get("running", True):
+            state = "stopped"
+        elif str(account.runtime.get("wechat_login_status") or "") == "logged_out":
+            state = "login_required"
         public_runtime = account.public_runtime()
         public_runtime["registered"] = True
         try:

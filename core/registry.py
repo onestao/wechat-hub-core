@@ -106,21 +106,8 @@ class AccountConfig:
         return str(self.runtime.get("runtime_provider") or "legacy")
 
     def public_runtime(self) -> dict[str, Any]:
-        runtime = dict(self.runtime)
-        runtime.pop("controller_command", None)
-        runtime.pop("key_file", None)
-        runtime.pop("agent_wechat_token_file", None)
-        runtime.setdefault("sender_capabilities", provider_sender_capabilities(self.runtime_provider))
-        runtime["display"] = self.display
-        if self.window_id:
-            runtime["window_id"] = self.window_id
-        if self.instance_uuid:
-            runtime["instance_uuid"] = self.instance_uuid
-        if self.runtime_alias:
-            runtime["runtime_alias"] = self.runtime_alias
-        if self.resource_key:
-            runtime["resource_key"] = self.resource_key
-        return runtime
+        from .runtime_bridge import canonical_runtime_projection
+        return canonical_runtime_projection(self)
 
 
 class AccountRegistry:
@@ -227,6 +214,7 @@ def parse_runtime_account(item: object, *, root: Path, registry_path: Path) -> A
     else:
         home = config_root / "agent-wechat" / resource_key / "home"
     unresolved_base = home / "Documents" / "xwechat_files" / "__runtime_unresolved__"
+    username = _text(item.get("username"), "username") or f"agent_{resource_key}"
     runtime: dict[str, Any] = {
         "runtime_bridge": "agent-wechat-v1" if provider == "agent_wechat" else "wechat-selkies-v1",
         "runtime_provider": provider,
@@ -239,6 +227,7 @@ def parse_runtime_account(item: object, *, root: Path, registry_path: Path) -> A
         "instance_uuid": instance_uuid,
         "runtime_alias": runtime_alias,
         "resource_key": resource_key,
+        "username": username,
     }
     if item.get("logged_in_user"):
         runtime["logged_in_user"] = str(item["logged_in_user"]).strip()

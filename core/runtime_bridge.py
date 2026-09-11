@@ -16,7 +16,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .registry import AccountConfig
+from .registry import AccountConfig, provider_sender_capabilities
 from .source_provenance import DATA_DIR_PLACEHOLDERS, SourceIdentityError, valid_wxid
 
 
@@ -152,44 +152,101 @@ def discover_source_db(home: Path) -> tuple[Path, Path] | None:
     return source_db, source_db.parent
 
 
+def canonical_runtime_projection(
+    account: AccountConfig,
+    status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Produce a deterministic, canonical runtime projection dictionary.
+
+    Ensures both CoreService._apply_runtime_status and AccountWorker.run_account
+    persist the exact same shape for identical registry + Runtime inputs.
+    """
+    runtime = dict(account.runtime)
+    runtime.pop("controller_command", None)
+    runtime.pop("key_file", None)
+    runtime.pop("agent_wechat_token_file", None)
+    runtime["registered"] = True
+    s = status or {}
+    provider = str(s.get("runtime_provider") or runtime.get("runtime_provider") or account.runtime_provider or "legacy")
+    runtime["runtime_provider"] = provider
+    runtime.setdefault("sender_capabilities", provider_sender_capabilities(provider))
+    runtime["display"] = "isolated" if provider == "agent_wechat" else (account.display or ":1")
+    if account.window_id:
+        runtime["window_id"] = account.window_id
+    instance_uuid = str(s.get("instance_uuid") or account.instance_uuid or "").strip()
+    if instance_uuid:
+        runtime["instance_uuid"] = instance_uuid
+    runtime_alias = str(s.get("runtime_alias") or account.runtime_alias or account.account_id).strip()
+    if runtime_alias:
+        runtime["runtime_alias"] = runtime_alias
+    resource_key = str(s.get("resource_key") or account.resource_key or account.account_id).strip()
+    if resource_key:
+        runtime["resource_key"] = resource_key
+    runtime["running"] = bool(s.get("running", runtime.get("running", False)))
+    runtime["container_running"] = bool(
+        s.get("container_running", s.get("running", runtime.get("container_running", False)))
+    )
+    runtime["agent_server_healthy"] = s.get("agent_server_healthy", runtime.get("agent_server_healthy"))
+    runtime["runtime_health"] = s.get("runtime_health", runtime.get("runtime_health"))
+    runtime["health_error"] = str(s.get("health_error") or runtime.get("health_error") or "")
+    runtime["wechat_login_status"] = str(s.get("wechat_login_status") or runtime.get("wechat_login_status") or "")
+    runtime["logged_in_user"] = str(s.get("logged_in_user") or runtime.get("logged_in_user") or "").strip()
+    runtime["username"] = str(
+        s.get("username")
+        or runtime.get("username")
+        or f"agent_{account.resource_key or account.account_id}"
+    )
+    runtime["uid"] = s.get("uid", runtime.get("uid"))
+    runtime["home"] = s.get("home") or runtime.get("source_home") or ""
+    runtime["autostart"] = bool(s.get("autostart", runtime.get("autostart", True)))
+    runtime["container_id"] = str(s.get("container_id") or runtime.get("container_id") or "").strip()
+    runtime["container_name"] = str(s.get("container_name") or runtime.get("container_name") or "").strip()
+    runtime["image"] = s.get("image", runtime.get("image"))
+    runtime["current_image"] = s.get("current_image", runtime.get("current_image"))
+    runtime["image_update_pending"] = s.get("image_update_pending", runtime.get("image_update_pending"))
+    runtime["capabilities"] = s.get("capabilities", runtime.get("capabilities"))
+    runtime["pids"] = list(s.get("pids") or runtime.get("pids") or [])
+    runtime["windows"] = list(s.get("windows") or runtime.get("windows") or [])
+    runtime["window_error"] = s.get("window_error", runtime.get("window_error"))
+    return runtime
+
+
 def discover_agent_wechat_source_db(
     home: Path,
     logged_in_user: str,
     account_id: str = "",
+    bound_wxid: str = "",
 ) -> tuple[Path, Path] | None:
     """Locate the AgentWechat db_storage for exactly the logged-in WeChat identity.
 
-    RB-003 fail-closed semantics:
-    1. If ``logged_in_user`` is a valid wxid:
-       - check ``<home>/Documents/xwechat_files/<logged_in_user>/db_storage`` and
-         ``<home>/xwechat_files/<logged_in_user>/db_storage``;
-       - if found, select exactly that directory (never compare mtime across wxids);
-       - if not found but other valid wxid db_storage directories exist, fail closed
-         with ``SourceIdentityError("source_identity_mismatch")`` instead of silently
-         ingesting a historical account's data under the live login;
-       - if no valid wxid directory exists at all, return ``None`` (unresolved).
-    2. If ``logged_in_user`` is missing or not a valid wxid, keep the documented
-       legacy ``discover_source_db`` mtime behavior.
+    RB-003 and Retry2 invariants:
+    1. If fresh valid logged_in_user is present:
+       - If bound_wxid is also present and logged_in_user != bound_wxid -> FAIL CLOSED.
+       - Check for <home>/.../<logged_in_user>/db_storage.
+       - If found, select it.
+       - If not found but other valid wxid directories exist, FAIL CLOSED with SourceIdentityError.
+       - If no directories exist, return None.
+    2. If logged_in_user is missing/invalid:
+       - If valid bound_wxid is present (account already bound):
+         - Check for <home>/.../<bound_wxid>/db_storage.
+         - If found, select it (never select historical wxid by mtime).
+         - If not found but other directories exist, FAIL CLOSED with SourceIdentityError.
+         - If no directories exist, return None.
+       - If bound_wxid is also not present:
+         - Keep legacy discover_source_db behavior for unconstrained/legacy caller.
     """
-    if not valid_wxid(logged_in_user):
-        return discover_source_db(home)
-
-    bases = [home / "Documents" / "xwechat_files", home / "xwechat_files"]
-    expected_candidates: list[Path] = []
-    other_wxids: dict[str, Path] = {}
-
     def modified(path: Path) -> float:
         try:
             return path.stat().st_mtime
         except OSError:
             return 0.0
 
+    bases = [home / "Documents" / "xwechat_files", home / "xwechat_files"]
+    all_wxid_dirs: dict[str, list[Path]] = {}
+
     for base in bases:
         if not base.is_dir():
             continue
-        expected_path = base / logged_in_user / "db_storage"
-        if expected_path.is_dir():
-            expected_candidates.append(expected_path)
         try:
             children = list(base.iterdir())
         except OSError:
@@ -198,31 +255,72 @@ def discover_agent_wechat_source_db(
             if not child.is_dir():
                 continue
             child_name = child.name
-            if child_name == logged_in_user:
-                continue
             db_storage = child / "db_storage"
             if (
                 db_storage.is_dir()
                 and valid_wxid(child_name)
                 and child_name not in DATA_DIR_PLACEHOLDERS
             ):
-                other_wxids[child_name] = db_storage
+                all_wxid_dirs.setdefault(child_name, []).append(db_storage)
 
-    if expected_candidates:
-        chosen = max(expected_candidates, key=modified)
-        return chosen, chosen.parent
+    found_wxids = sorted(all_wxid_dirs.keys())
 
-    if other_wxids:
-        found = sorted(other_wxids.keys())
-        raise SourceIdentityError(
-            "source_identity_mismatch",
-            409,
-            f"source db identity mismatch for account {account_id or 'unknown'}: "
-            f"expected {logged_in_user} beneath {home}, but found other wxid directories: {found}",
-            details={"account_id": account_id, "expected_wxid": logged_in_user, "found_wxids": found, "source_home": str(home)},
-        )
+    # Case 1: Fresh valid logged_in_user observed
+    if valid_wxid(logged_in_user):
+        if valid_wxid(bound_wxid) and logged_in_user != bound_wxid:
+            raise SourceIdentityError(
+                "source_identity_mismatch",
+                409,
+                f"source db identity mismatch for account {account_id or 'unknown'}: "
+                f"fresh observed user {logged_in_user!r} conflicts with bound identity {bound_wxid!r}",
+                details={
+                    "account_id": account_id,
+                    "expected_wxid": logged_in_user,
+                    "bound_wxid": bound_wxid,
+                    "found_wxids": found_wxids,
+                    "source_home": str(home),
+                },
+            )
+        if logged_in_user in all_wxid_dirs:
+            chosen = max(all_wxid_dirs[logged_in_user], key=modified)
+            return chosen, chosen.parent
+        if found_wxids:
+            raise SourceIdentityError(
+                "source_identity_mismatch",
+                409,
+                f"source db identity mismatch for account {account_id or 'unknown'}: "
+                f"expected {logged_in_user} beneath {home}, but found other wxid directories: {found_wxids}",
+                details={
+                    "account_id": account_id,
+                    "expected_wxid": logged_in_user,
+                    "found_wxids": found_wxids,
+                    "source_home": str(home),
+                },
+            )
+        return None
 
-    return None
+    # Case 2: Transient missing/invalid logged_in_user, but account is bound
+    if valid_wxid(bound_wxid):
+        if bound_wxid in all_wxid_dirs:
+            chosen = max(all_wxid_dirs[bound_wxid], key=modified)
+            return chosen, chosen.parent
+        if found_wxids:
+            raise SourceIdentityError(
+                "source_identity_mismatch",
+                409,
+                f"source db identity mismatch for account {account_id or 'unknown'}: "
+                f"bound identity {bound_wxid!r} not found beneath {home}; found other wxid directories: {found_wxids}",
+                details={
+                    "account_id": account_id,
+                    "bound_wxid": bound_wxid,
+                    "found_wxids": found_wxids,
+                    "source_home": str(home),
+                },
+            )
+        return None
+
+    # Case 3: Neither logged_in_user nor bound_wxid is valid -> legacy fallback
+    return discover_source_db(home)
 
 
 def _agent_runtime_status(account: AccountConfig) -> dict[str, Any]:
@@ -236,7 +334,7 @@ def _agent_runtime_status(account: AccountConfig) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def resolve_runtime_account(account: AccountConfig) -> AccountConfig:
+def resolve_runtime_account(account: AccountConfig, bound_wxid: str = "") -> AccountConfig:
     """Refresh PID/window/source paths for an account derived from package A."""
     if not account.runtime.get("runtime_bridge"):
         return account
@@ -244,24 +342,11 @@ def resolve_runtime_account(account: AccountConfig) -> AccountConfig:
 
     if account.runtime_provider == "agent_wechat":
         status = _agent_runtime_status(account)
-        container_id = str(status.get("container_id") or "").strip()
-        runtime["container_id"] = container_id
-        # AgentWechat containers intentionally keep isolated PID namespaces so
-        # each upstream instance can only discover its own WeChat process.
-        # Core imports stored DB credentials from that account's agent.db
-        # instead of ptracing the child process.
-        runtime["pids"] = []
-        runtime["running"] = bool(status.get("running"))
-        for key in (
-            "container_running",
-            "agent_server_healthy",
-            "runtime_health",
-            "health_error",
-            "wechat_login_status",
-            "logged_in_user",
-        ):
-            if key in status:
-                runtime[key] = status[key]
+        runtime = canonical_runtime_projection(account, status)
+        effective_bound = bound_wxid or str(account.runtime.get("bound_wxid") or "").strip()
+        if effective_bound:
+            runtime["bound_wxid"] = effective_bound
+
         source_db_dir = account.source_db_dir
         wechat_base_dir = account.wechat_base_dir
         source_home = str(runtime.get("source_home") or "").strip()
@@ -271,6 +356,7 @@ def resolve_runtime_account(account: AccountConfig) -> AccountConfig:
                 Path(source_home),
                 logged_in_user,
                 account_id=account.account_id,
+                bound_wxid=effective_bound,
             )
             if discovered:
                 source_db_dir, wechat_base_dir = discovered
