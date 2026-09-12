@@ -214,8 +214,39 @@ class CoreStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self._transaction_state = threading.local()
+        self._account_status_locks_guard = threading.Lock()
+        self._account_status_locks: dict[str, threading.RLock] = {}
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.init_schema()
+
+    def _account_status_lock(self, account_id: str) -> threading.RLock:
+        """Return a process-local serialization lock for one account status row.
+
+        Core has a single service process with multiple writer threads.  The
+        lock closes the stale-before window in ``upsert_account`` without
+        serializing unrelated accounts at the Python layer.  ``RLock`` keeps
+        nested store transaction usage safe for same-thread callers.
+        """
+        with self._account_status_locks_guard:
+            lock = self._account_status_locks.get(account_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._account_status_locks[account_id] = lock
+            return lock
+
+    @contextmanager
+    def account_status_guard(self, account_id: str):
+        """Serialize one account's status projection and persistence.
+
+        ``upsert_account`` always acquires the same re-entrant lock itself so
+        the store-level dedup invariant does not depend on callers.  Runtime
+        and Worker paths may also hold this guard while they read the previous
+        persisted projection and build the next one, preventing a stale
+        pre-lock projection from overwriting a newer authoritative login
+        transition.
+        """
+        with self._account_status_lock(account_id):
+            yield
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30)
@@ -697,42 +728,43 @@ class CoreStore:
         runtime: dict[str, Any] | None = None,
         sync: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        now = utc_now()
-        output = {
-            "account_id": account_id,
-            "display_name": display_name,
-            "state": state,
-            "runtime": runtime or {},
-            "sync": sync or {},
-        }
-        # Account-status persistence is idempotent: a failed attempt rolls back
-        # its whole transaction and the retry rewrites the identical row, while
-        # event emission below is digest-guarded.  Only this idempotent path may
-        # retry on a transient SQLite lock; business-data writes never do.
-        for attempt, retry_delay in enumerate((0.0, *SQLITE_LOCK_RETRY_DELAYS)):
-            if retry_delay:
-                time.sleep(retry_delay)
-            try:
-                with self.connection() as conn:
-                    before = conn.execute("SELECT * FROM accounts WHERE account_id=?", (account_id,)).fetchone()
-                    conn.execute(
-                        """
-                        INSERT INTO accounts (account_id, display_name, state, runtime_json, sync_json, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(account_id) DO UPDATE SET
-                            display_name=excluded.display_name, state=excluded.state,
-                            runtime_json=excluded.runtime_json, sync_json=excluded.sync_json,
-                            updated_at=excluded.updated_at
-                        """,
-                        (account_id, display_name, state, compact_json(output["runtime"]), compact_json(output["sync"]), now),
-                    )
-                    before_value = self._account_row(before) if before is not None else None
-                    if before_value is None or account_status_event_semantic(before_value) != account_status_event_semantic(output):
-                        self._append_event(conn, account_id, "account.status", {"account": output})
-                return output
-            except sqlite3.OperationalError as exc:
-                if not is_transient_sqlite_lock(exc) or attempt >= len(SQLITE_LOCK_RETRY_DELAYS):
-                    raise
+        with self._account_status_lock(account_id):
+            now = utc_now()
+            output = {
+                "account_id": account_id,
+                "display_name": display_name,
+                "state": state,
+                "runtime": runtime or {},
+                "sync": sync or {},
+            }
+            # Account-status persistence is idempotent: a failed attempt rolls back
+            # its whole transaction and the retry rewrites the identical row, while
+            # event emission below is semantic-guarded.  Only this idempotent path may
+            # retry on a transient SQLite lock; business-data writes never do.
+            for attempt, retry_delay in enumerate((0.0, *SQLITE_LOCK_RETRY_DELAYS)):
+                if retry_delay:
+                    time.sleep(retry_delay)
+                try:
+                    with self.connection() as conn:
+                        before = conn.execute("SELECT * FROM accounts WHERE account_id=?", (account_id,)).fetchone()
+                        conn.execute(
+                            """
+                            INSERT INTO accounts (account_id, display_name, state, runtime_json, sync_json, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(account_id) DO UPDATE SET
+                                display_name=excluded.display_name, state=excluded.state,
+                                runtime_json=excluded.runtime_json, sync_json=excluded.sync_json,
+                                updated_at=excluded.updated_at
+                            """,
+                            (account_id, display_name, state, compact_json(output["runtime"]), compact_json(output["sync"]), now),
+                        )
+                        before_value = self._account_row(before) if before is not None else None
+                        if before_value is None or account_status_event_semantic(before_value) != account_status_event_semantic(output):
+                            self._append_event(conn, account_id, "account.status", {"account": output})
+                    return output
+                except sqlite3.OperationalError as exc:
+                    if not is_transient_sqlite_lock(exc) or attempt >= len(SQLITE_LOCK_RETRY_DELAYS):
+                        raise
         raise RuntimeError("unreachable: upsert_account retry loop must return or raise")  # pragma: no cover
 
     # ------------------------------------------------------------------

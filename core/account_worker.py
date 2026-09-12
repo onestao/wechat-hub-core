@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 import traceback
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -205,6 +206,112 @@ class AccountWorker:
             },
         )
 
+    def _persist_final_account_status(
+        self,
+        account: AccountConfig,
+        *,
+        state: str,
+        sync_status: dict[str, Any],
+    ) -> tuple[AccountConfig, str]:
+        """Persist the final Worker projection from a fresh ordered Runtime view.
+
+        The decrypt/import portion of a sync cycle can take long enough for a
+        Runtime/API writer to observe an explicit logout or health transition
+        after this Worker's initial runtime resolution.  Re-resolve only the
+        cheap Runtime projection at persistence time while holding the same
+        per-account guard as ``CoreStore.upsert_account``.  This prevents a
+        stale healthy-gap projection from overwriting a newer authoritative
+        negative state without serializing the expensive sync body.
+        """
+        # Retry3's second Runtime observation is only needed for AgentWechat,
+        # where login/source telemetry can change independently while a sync
+        # cycle is decrypting/importing.  Keep legacy providers on their
+        # established fast path: CoreStore.upsert_account still supplies the
+        # per-account semantic dedup lock, but there is no extra account row /
+        # binding read or Runtime re-resolution on every legacy cycle.
+        if account.runtime_provider != "agent_wechat":
+            final_state = state
+            if not account.runtime.get("running", True):
+                final_state = "stopped"
+            elif account.runtime.get("agent_server_healthy") is False:
+                final_state = "degraded"
+            elif str(account.runtime.get("wechat_login_status") or "").strip() == "logged_out":
+                final_state = "login_required"
+            public_runtime = account.public_runtime()
+            public_runtime["registered"] = True
+            self.store.upsert_account(
+                account.account_id,
+                account.display_name,
+                state=final_state,
+                runtime=public_runtime,
+                sync=sync_status,
+            )
+            return account, final_state
+
+        with self.store.account_status_guard(account.account_id):
+            latest_existing = self.store.account(account.account_id)
+            latest_account = account
+            latest_binding = self.store.binding_state(account.account_id)
+            latest_bound_wxid = str(
+                (latest_binding.get("identity") or {}).get("wechat_user_id") or ""
+            ).strip()
+            try:
+                latest_account = resolve_runtime_account(
+                    account,
+                    bound_wxid=latest_bound_wxid,
+                    previous_runtime=(latest_existing or {}).get("runtime") or {},
+                    binding_state=str(latest_binding.get("state") or ""),
+                )
+            except SourceIdentityError as exc:
+                # A fresh final projection can itself discover that the
+                # current AgentWechat source is no longer provenance-safe.
+                # Do not turn that fail-closed result into a persistence
+                # failure that leaves the previous account row looking
+                # healthy.  Persist the error state using the last safe
+                # runtime projection; business-data writes have already
+                # been gated by the earlier provenance checks in this
+                # cycle, so this branch is observability-only.
+                final_runtime = dict((latest_existing or {}).get("runtime") or {})
+                if final_runtime:
+                    latest_account = replace(account, runtime=final_runtime)
+                state = "error"
+                sync_status["ok"] = False
+                sync_status.setdefault("error", str(exc))
+                sync_status.setdefault(
+                    "source_provenance",
+                    {"code": exc.code, "status": exc.status, **exc.details},
+                )
+
+            final_state = state
+            if not latest_account.runtime.get("running", True):
+                final_state = "stopped"
+            elif latest_account.runtime.get("agent_server_healthy") is False:
+                final_state = "degraded"
+            else:
+                final_login_status = str(
+                    latest_account.runtime.get("wechat_login_status") or ""
+                ).strip()
+                if final_login_status == "logged_out":
+                    final_state = "login_required"
+                elif final_login_status != "logged_in":
+                    # Unknown/empty telemetry after an authoritative negative
+                    # state is not evidence of recovery.  Keep that latest
+                    # state until a fresh valid positive observation arrives.
+                    latest_state = str((latest_existing or {}).get("state") or "")
+                    if latest_state in {"login_required", "stopped", "degraded"}:
+                        final_state = latest_state
+
+            public_runtime = latest_account.public_runtime()
+            public_runtime["registered"] = True
+            self.store.upsert_account(
+                latest_account.account_id,
+                latest_account.display_name,
+                state=final_state,
+                runtime=public_runtime,
+                sync=sync_status,
+            )
+            return latest_account, final_state
+
     def run_account(self, account: AccountConfig, *, force_refresh: bool = False) -> dict[str, Any]:
         started = time.monotonic()
         status: dict[str, Any] = {
@@ -214,9 +321,20 @@ class AccountWorker:
             "source_db_dir": str(account.source_db_dir),
         }
         try:
-            binding_info = self.store.binding_state(account.account_id)
-            bound_wxid = str((binding_info.get("identity") or {}).get("wechat_user_id") or "").strip()
-            account = resolve_runtime_account(account, bound_wxid=bound_wxid)
+            if account.runtime_provider == "agent_wechat":
+                existing_account = self.store.account(account.account_id)
+                binding_info = self.store.binding_state(account.account_id)
+                bound_wxid = str(
+                    (binding_info.get("identity") or {}).get("wechat_user_id") or ""
+                ).strip()
+                account = resolve_runtime_account(
+                    account,
+                    bound_wxid=bound_wxid,
+                    previous_runtime=(existing_account or {}).get("runtime") or {},
+                    binding_state=str(binding_info.get("state") or ""),
+                )
+            else:
+                account = resolve_runtime_account(account)
             status["source_db_dir"] = str(account.source_db_dir)
             self._assert_source_provenance(account)
 
@@ -417,19 +535,11 @@ class AccountWorker:
         if self.registry.get(account.account_id) is None:
             status["deregistered_during_sync"] = True
             return status
-        if not account.runtime.get("running", True):
-            state = "stopped"
-        elif str(account.runtime.get("wechat_login_status") or "") == "logged_out":
-            state = "login_required"
-        public_runtime = account.public_runtime()
-        public_runtime["registered"] = True
         try:
-            self.store.upsert_account(
-                account.account_id,
-                account.display_name,
+            account, state = self._persist_final_account_status(
+                account,
                 state=state,
-                runtime=public_runtime,
-                sync=status,
+                sync_status=status,
             )
         except Exception as exc:
             # Final account-status persistence must never kill the worker.

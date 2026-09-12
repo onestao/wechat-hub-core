@@ -152,9 +152,107 @@ def discover_source_db(home: Path) -> tuple[Path, Path] | None:
     return source_db, source_db.parent
 
 
+def merge_authoritative_login_observation(
+    projected_runtime: dict[str, Any],
+    status: dict[str, Any] | None,
+    *,
+    previous_runtime: dict[str, Any] | None = None,
+    bound_wxid: str = "",
+    binding_state: str = "",
+) -> tuple[str, str]:
+    """Merge fresh login telemetry without turning a healthy gap into logout.
+
+    Runtime occasionally publishes a healthy ``unknown`` / empty-user sample
+    between two verified samples for the same bound WeChat identity.  Such a
+    sample is not an authoritative negative observation.  Preserve the last
+    verified bound login only while the runtime is still running and no health
+    signal explicitly failed.  Explicit logout and any fresh valid identity
+    (including a conflicting one) always win.
+
+    ``status is None`` means there is no fresh Runtime observation (for
+    example ``AccountConfig.public_runtime()`` on an already-resolved account),
+    so the account's existing projected login fields are returned unchanged.
+    """
+    if status is None:
+        return (
+            str(projected_runtime.get("wechat_login_status") or "").strip(),
+            str(projected_runtime.get("logged_in_user") or "").strip(),
+        )
+
+    incoming_status = str(status.get("wechat_login_status") or "").strip()
+    incoming_user = str(status.get("logged_in_user") or "").strip()
+
+    if incoming_status == "logged_out":
+        return "logged_out", ""
+
+    # A fresh valid identity must never be replaced by remembered state.  This
+    # deliberately preserves conflicting wxids so Identity-v2 / RB-003 can
+    # fail closed downstream.
+    if valid_wxid(incoming_user):
+        return incoming_status or "unknown", incoming_user
+
+    running = bool(projected_runtime.get("running", False))
+    container_running = bool(projected_runtime.get("container_running", running))
+    agent_health = projected_runtime.get("agent_server_healthy")
+    runtime_health = str(projected_runtime.get("runtime_health") or "").strip().lower()
+    explicitly_unhealthy = agent_health is False or runtime_health in {
+        "degraded",
+        "failed",
+        "unhealthy",
+        "error",
+        "offline",
+        "stopped",
+    }
+
+    previous = previous_runtime if isinstance(previous_runtime, dict) else {}
+    previous_status = str(previous.get("wechat_login_status") or "").strip()
+    previous_user = str(previous.get("logged_in_user") or "").strip()
+    # ``logged_in`` without a valid identity is not a complete authoritative
+    # positive observation.  Treat it like the other transient/partial status
+    # samples so a previously verified bound login is not erased merely
+    # because Runtime published the status and identity fields non-atomically.
+    observation_is_gap = incoming_status in {
+        "",
+        "unknown",
+        "checking",
+        "starting",
+        "pending",
+        "unavailable",
+        "logged_in",
+    }
+
+    if (
+        observation_is_gap
+        and running
+        and container_running
+        and not explicitly_unhealthy
+        and str(binding_state or "").strip().lower() == "bound"
+        and valid_wxid(bound_wxid)
+        and previous_status == "logged_in"
+        and valid_wxid(previous_user)
+        and previous_user == bound_wxid
+    ):
+        return "logged_in", previous_user
+
+    # ``logged_in`` without a valid user is incomplete positive telemetry.  If
+    # it cannot be safely merged with a previously verified bound login above,
+    # do not let the status word alone manufacture an ``online`` transition
+    # after a real logout/degradation.  Surface it as unknown until a valid
+    # identity arrives.
+    if incoming_status == "logged_in":
+        return "unknown", ""
+
+    # Invalid/empty identity telemetry is not persisted as an identity claim.
+    return incoming_status, ""
+
+
 def canonical_runtime_projection(
     account: AccountConfig,
     status: dict[str, Any] | None = None,
+    *,
+    previous_runtime: dict[str, Any] | None = None,
+    bound_wxid: str = "",
+    binding_state: str = "",
 ) -> dict[str, Any]:
     """Produce a deterministic, canonical runtime projection dictionary.
 
@@ -162,11 +260,31 @@ def canonical_runtime_projection(
     persist the exact same shape for identical registry + Runtime inputs.
     """
     runtime = dict(account.runtime)
+    previous = previous_runtime if isinstance(previous_runtime, dict) else {}
     runtime.pop("controller_command", None)
     runtime.pop("key_file", None)
     runtime.pop("agent_wechat_token_file", None)
     runtime["registered"] = True
     s = status or {}
+
+    def observed_or_previous(key: str, fallback: Any = None) -> Any:
+        """Prefer an explicit fresh value, then the latest persisted runtime.
+
+        Worker projections can be built from an ``AccountConfig`` resolved at
+        the start of a comparatively long sync cycle.  If the final Runtime
+        status read is partial/missing, falling back to that stale config can
+        overwrite a newer explicit stopped/unhealthy observation already
+        persisted by the Runtime/API writer.  The latest persisted projection
+        is therefore the safe fallback for dynamic telemetry.  ``False`` is a
+        meaningful fresh value; only an absent/``None`` observation falls
+        through.
+        """
+        if key in s and s.get(key) is not None:
+            return s.get(key)
+        if key in previous:
+            return previous.get(key)
+        return runtime.get(key, fallback)
+
     provider = str(s.get("runtime_provider") or runtime.get("runtime_provider") or account.runtime_provider or "legacy")
     runtime["runtime_provider"] = provider
     runtime.setdefault("sender_capabilities", provider_sender_capabilities(provider))
@@ -182,15 +300,34 @@ def canonical_runtime_projection(
     resource_key = str(s.get("resource_key") or account.resource_key or account.account_id).strip()
     if resource_key:
         runtime["resource_key"] = resource_key
-    runtime["running"] = bool(s.get("running", runtime.get("running", False)))
-    runtime["container_running"] = bool(
-        s.get("container_running", s.get("running", runtime.get("container_running", False)))
+    runtime["running"] = bool(observed_or_previous("running", False))
+    if "container_running" in s and s.get("container_running") is not None:
+        runtime["container_running"] = bool(s.get("container_running"))
+    elif "running" in s and s.get("running") is not None:
+        runtime["container_running"] = bool(s.get("running"))
+    elif "container_running" in previous:
+        runtime["container_running"] = bool(previous.get("container_running"))
+    elif "running" in previous:
+        runtime["container_running"] = bool(previous.get("running"))
+    else:
+        runtime["container_running"] = bool(runtime.get("container_running", runtime["running"]))
+    runtime["agent_server_healthy"] = observed_or_previous("agent_server_healthy")
+    runtime["runtime_health"] = observed_or_previous("runtime_health")
+    if "health_error" in s:
+        runtime["health_error"] = str(s.get("health_error") or "")
+    elif "health_error" in previous:
+        runtime["health_error"] = str(previous.get("health_error") or "")
+    else:
+        runtime["health_error"] = str(runtime.get("health_error") or "")
+    login_status, logged_in_user = merge_authoritative_login_observation(
+        runtime,
+        status,
+        previous_runtime=previous_runtime,
+        bound_wxid=bound_wxid,
+        binding_state=binding_state,
     )
-    runtime["agent_server_healthy"] = s.get("agent_server_healthy", runtime.get("agent_server_healthy"))
-    runtime["runtime_health"] = s.get("runtime_health", runtime.get("runtime_health"))
-    runtime["health_error"] = str(s.get("health_error") or runtime.get("health_error") or "")
-    runtime["wechat_login_status"] = str(s.get("wechat_login_status") or runtime.get("wechat_login_status") or "")
-    runtime["logged_in_user"] = str(s.get("logged_in_user") or runtime.get("logged_in_user") or "").strip()
+    runtime["wechat_login_status"] = login_status
+    runtime["logged_in_user"] = logged_in_user
     runtime["username"] = str(
         s.get("username")
         or runtime.get("username")
@@ -334,7 +471,13 @@ def _agent_runtime_status(account: AccountConfig) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def resolve_runtime_account(account: AccountConfig, bound_wxid: str = "") -> AccountConfig:
+def resolve_runtime_account(
+    account: AccountConfig,
+    bound_wxid: str = "",
+    *,
+    previous_runtime: dict[str, Any] | None = None,
+    binding_state: str = "",
+) -> AccountConfig:
     """Refresh PID/window/source paths for an account derived from package A."""
     if not account.runtime.get("runtime_bridge"):
         return account
@@ -342,8 +485,14 @@ def resolve_runtime_account(account: AccountConfig, bound_wxid: str = "") -> Acc
 
     if account.runtime_provider == "agent_wechat":
         status = _agent_runtime_status(account)
-        runtime = canonical_runtime_projection(account, status)
         effective_bound = bound_wxid or str(account.runtime.get("bound_wxid") or "").strip()
+        runtime = canonical_runtime_projection(
+            account,
+            status,
+            previous_runtime=previous_runtime,
+            bound_wxid=effective_bound,
+            binding_state=binding_state,
+        )
         if effective_bound:
             runtime["bound_wxid"] = effective_bound
 

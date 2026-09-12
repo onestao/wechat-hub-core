@@ -455,69 +455,87 @@ class CoreService:
                 runtime_provider=provider,
             )
 
-        existing = self.store.account(account_id)
         from .runtime_bridge import canonical_runtime_projection
-        runtime = canonical_runtime_projection(config, status)
-        if not runtime["running"]:
-            state = "stopped"
-        elif str(runtime.get("runtime_provider") or config.runtime_provider) == "agent_wechat" and status.get("agent_server_healthy") is False:
-            state = "degraded"
-        elif str(runtime.get("runtime_provider") or config.runtime_provider) == "agent_wechat" and status.get("agent_server_healthy") is True:
-            login_status = str(status.get("wechat_login_status") or "unknown")
-            if login_status == "logged_in":
-                existing_sync = (existing or {}).get("sync") or {}
-                if existing_sync.get("ok") is False:
-                    state = "degraded"
+
+        # The previous projection is part of the login-observation merge, so
+        # reading it outside the same-account serialization point would leave
+        # a stale-projection race: an unknown/empty sample could be built from
+        # an old verified login, an explicit logout could commit, and the stale
+        # gap projection could then overwrite that logout.  Hold the same
+        # re-entrant guard used by CoreStore.upsert_account from read/merge
+        # through persistence (and the matching identity observation).
+        with self.store.account_status_guard(account_id):
+            existing = self.store.account(account_id)
+            binding_info = self.store.binding_state(account_id)
+            bound_wxid = str((binding_info.get("identity") or {}).get("wechat_user_id") or "").strip()
+            binding_state = str(binding_info.get("state") or "").strip()
+            runtime = canonical_runtime_projection(
+                config,
+                status,
+                previous_runtime=(existing or {}).get("runtime") or {},
+                bound_wxid=bound_wxid,
+                binding_state=binding_state,
+            )
+            if not runtime["running"]:
+                state = "stopped"
+            elif str(runtime.get("runtime_provider") or config.runtime_provider) == "agent_wechat" and status.get("agent_server_healthy") is False:
+                state = "degraded"
+            elif str(runtime.get("runtime_provider") or config.runtime_provider) == "agent_wechat" and status.get("agent_server_healthy") is True:
+                login_status = str(runtime.get("wechat_login_status") or "unknown")
+                if login_status == "logged_in":
+                    existing_sync = (existing or {}).get("sync") or {}
+                    if existing_sync.get("ok") is False:
+                        state = "degraded"
+                    else:
+                        state = "online"
+                elif login_status == "logged_out":
+                    state = "login_required"
                 else:
-                    state = "online"
-            elif login_status == "logged_out":
-                state = "login_required"
+                    current_state = str((existing or {}).get("state") or "offline")
+                    state = current_state if current_state not in {"offline", "stopped", "degraded"} else "starting"
+            elif str(status.get("action") or "") in {"started", "restarted"}:
+                state = "starting"
             else:
                 current_state = str((existing or {}).get("state") or "offline")
-                state = current_state if current_state not in {"offline", "stopped", "degraded"} else "starting"
-        elif str(status.get("action") or "") in {"started", "restarted"}:
-            state = "starting"
-        else:
-            current_state = str((existing or {}).get("state") or "offline")
-            state = current_state if current_state not in {"offline", "stopped"} else "starting"
-        projected = {
-            "account_id": account_id,
-            "display_name": str(status.get("display_name") or config.display_name),
-            "state": state,
-            "runtime": runtime,
-            "sync": (existing or {}).get("sync") or {},
-        }
-        if existing is not None and account_status_event_semantic(existing) == account_status_event_semantic(projected):
-            # Steady-state GET /health and GET /v1/accounts polling must not
-            # become a DB writer: every poll previously rewrote the identical
-            # row, contending with long import_account transactions for the
-            # single SQLite writer slot.  Skip unchanged projections; the API
-            # response below is unchanged.
-            return
-        self.store.upsert_account(
-            account_id,
-            projected["display_name"],
-            state=state,
-            runtime=runtime,
-            sync=projected["sync"],
-        )
-        observed_user = str(status.get("logged_in_user") or "").strip()
-        if observed_user and identity_v2.valid_wxid(observed_user):
-            # Runtime-verified login observation feeds the binding state
-            # machine (first bind / same identity / mismatch) before any sync
-            # or send can use this slot.
-            try:
-                self.store.observe_login(
-                    account_id,
-                    observed_user,
-                    verified_source=(
-                        identity_v2.VERIFIED_SOURCE_AGENT_AUTH
-                        if str(runtime.get("runtime_provider") or config.runtime_provider) == "agent_wechat"
-                        else identity_v2.VERIFIED_SOURCE_RUNTIME_STATUS
-                    ),
-                )
-            except IdentityError:
-                pass
+                state = current_state if current_state not in {"offline", "stopped"} else "starting"
+            projected = {
+                "account_id": account_id,
+                "display_name": str(status.get("display_name") or config.display_name),
+                "state": state,
+                "runtime": runtime,
+                "sync": (existing or {}).get("sync") or {},
+            }
+            if existing is not None and account_status_event_semantic(existing) == account_status_event_semantic(projected):
+                # Steady-state GET /health and GET /v1/accounts polling must not
+                # become a DB writer: every poll previously rewrote the identical
+                # row, contending with long import_account transactions for the
+                # single SQLite writer slot.  Skip unchanged projections; the API
+                # response below is unchanged.
+                return
+            self.store.upsert_account(
+                account_id,
+                projected["display_name"],
+                state=state,
+                runtime=runtime,
+                sync=projected["sync"],
+            )
+            observed_user = str(status.get("logged_in_user") or "").strip()
+            if observed_user and identity_v2.valid_wxid(observed_user):
+                # Runtime-verified login observation feeds the binding state
+                # machine (first bind / same identity / mismatch) before any sync
+                # or send can use this slot.
+                try:
+                    self.store.observe_login(
+                        account_id,
+                        observed_user,
+                        verified_source=(
+                            identity_v2.VERIFIED_SOURCE_AGENT_AUTH
+                            if str(runtime.get("runtime_provider") or config.runtime_provider) == "agent_wechat"
+                            else identity_v2.VERIFIED_SOURCE_RUNTIME_STATUS
+                        ),
+                    )
+                except IdentityError:
+                    pass
 
     def create_runtime_account(self, payload: dict[str, Any]) -> dict[str, Any]:
         provider = str(payload.get("runtime_provider") or payload.get("provider") or "legacy").strip().lower()

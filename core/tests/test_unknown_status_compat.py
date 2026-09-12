@@ -4,10 +4,11 @@ The patched agent-wechat upstream returns status=unknown when the WeChat PID
 is alive but the current UI cannot be identified.  These tests pin the Core
 compatibility contract for that fresh-status semantics:
 
-* Runtime status sync with wechat_login_status=unknown must never flip an
-  account into a fresh logged_in claim: a previously online account keeps its
-  existing state, an inactive/offline/degraded account only advances to the
-  safe "starting" state.
+* Runtime status sync with wechat_login_status=unknown must never invent a
+  fresh logged_in claim.  Retry3 may, however, retain an already verified
+  bound logged-in identity across a healthy unknown/empty telemetry gap; an
+  inactive/offline/degraded account with no such verified bound evidence only
+  advances to the safe "starting" state.
 * An unknown observation must not queue or dispatch any send and must not
   fabricate a "sent" receipt.
 * A transient unknown must not clear account identity (display_name, username,
@@ -91,18 +92,24 @@ class UnknownAuthStatusCoreTest(unittest.TestCase):
         with sqlite3.connect(self.root / "core.sqlite") as conn:
             return int(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0])
 
-    def test_previous_online_then_unknown_keeps_state_without_fresh_login_claim(self):
+    def test_previous_verified_bound_login_then_unknown_keeps_verified_login_without_fresh_claim(self):
         self.service._apply_runtime_status(logged_in_runtime_status("alpha"))
         stored = self.store.account("alpha")
         self.assertEqual(stored["state"], "online")
+        self.assertEqual(stored["runtime"]["wechat_login_status"], "logged_in")
+        self.assertEqual(stored["runtime"]["logged_in_user"], "wxid_alpha")
+        binding = self.store.binding_state("alpha")
+        self.assertEqual(binding["state"], "bound")
 
         self.service._apply_runtime_status(unknown_runtime_status("alpha"))
         stored = self.store.account("alpha")
-        # Existing design: a transient unknown keeps the previous online state
-        # instead of inventing a fresh logged_in/login_required transition.
+        # Retry3 treats healthy unknown/empty telemetry as non-authoritative
+        # only when the previous verified identity still agrees with the bound
+        # slot.  The retained login below is therefore remembered verified
+        # evidence, not a fresh claim manufactured from ``unknown``.
         self.assertEqual(stored["state"], "online")
-        self.assertEqual(stored["runtime"]["wechat_login_status"], "unknown")
-        self.assertEqual(stored["runtime"]["logged_in_user"], "")
+        self.assertEqual(stored["runtime"]["wechat_login_status"], "logged_in")
+        self.assertEqual(stored["runtime"]["logged_in_user"], "wxid_alpha")
         self.assertTrue(stored["runtime"]["agent_server_healthy"])
         self.assertNotIn(stored["state"], {"stopped", "degraded", "error", "login_required"})
 
