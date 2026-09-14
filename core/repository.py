@@ -53,7 +53,7 @@ class MessageRepositoryProtocol(Protocol):
 
 @runtime_checkable
 class EventRepositoryProtocol(Protocol):
-    def poll_events(self, *, after: str, limit: int, account_id: str = "") -> dict[str, Any]: ...
+    def poll_events(self, *, after: str, limit: int, account_id: str = "", consumer_id: str = "") -> dict[str, Any]: ...
     def ack_events(self, consumer_id: str, event_ids: Iterable[str]) -> dict[str, Any]: ...
     def checkpoint_consumer(
         self,
@@ -64,6 +64,25 @@ class EventRepositoryProtocol(Protocol):
         subscription_account_id: str = "",
     ) -> dict[str, Any]: ...
     def get_checkpoint(self, consumer_id: str) -> dict[str, Any] | None: ...
+    def bootstrap_consumer(
+        self,
+        consumer_id: str,
+        *,
+        mode: str = "at_head",
+        window_size: int = 0,
+        source: str = "auto",
+    ) -> dict[str, Any]: ...
+    def rebootstrap_consumer(
+        self,
+        consumer_id: str,
+        *,
+        mode: str = "at_head",
+        window_size: int = 0,
+        source: str = "operator",
+        operator_token: str = "",
+        quiescence_evidence: str = "",
+    ) -> dict[str, Any]: ...
+    def get_bootstrap_provenance(self, consumer_id: str) -> dict[str, Any] | None: ...
 
 
 @runtime_checkable
@@ -132,8 +151,8 @@ class SQLiteCoreRepository:
     def upsert_message(self, account_id: str, message: dict[str, Any]) -> dict[str, Any]:
         return self.store.upsert_message(account_id, message)
 
-    def poll_events(self, *, after: str, limit: int, account_id: str = "") -> dict[str, Any]:
-        return self.store.poll_events(after=after, limit=limit, account_id=account_id)
+    def poll_events(self, *, after: str, limit: int, account_id: str = "", consumer_id: str = "") -> dict[str, Any]:
+        return self.store.poll_events(after=after, limit=limit, account_id=account_id, consumer_id=consumer_id)
 
     def ack_events(self, consumer_id: str, event_ids: Iterable[str]) -> dict[str, Any]:
         return self.store.ack_events(consumer_id, event_ids)
@@ -155,6 +174,40 @@ class SQLiteCoreRepository:
 
     def get_checkpoint(self, consumer_id: str) -> dict[str, Any] | None:
         return self.store.get_checkpoint(consumer_id)
+
+    def bootstrap_consumer(
+        self,
+        consumer_id: str,
+        *,
+        mode: str = "at_head",
+        window_size: int = 0,
+        source: str = "auto",
+    ) -> dict[str, Any]:
+        return self.store.bootstrap_consumer(
+            consumer_id, mode=mode, window_size=window_size, source=source
+        )
+
+    def rebootstrap_consumer(
+        self,
+        consumer_id: str,
+        *,
+        mode: str = "at_head",
+        window_size: int = 0,
+        source: str = "operator",
+        operator_token: str = "",
+        quiescence_evidence: str = "",
+    ) -> dict[str, Any]:
+        return self.store.rebootstrap_consumer(
+            consumer_id,
+            mode=mode,
+            window_size=window_size,
+            source=source,
+            operator_token=operator_token,
+            quiescence_evidence=quiescence_evidence,
+        )
+
+    def get_bootstrap_provenance(self, consumer_id: str) -> dict[str, Any] | None:
+        return self.store.get_bootstrap_provenance(consumer_id)
 
     def storage_capabilities(self) -> dict[str, Any]:
         return {

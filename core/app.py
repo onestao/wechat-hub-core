@@ -1029,13 +1029,14 @@ class CoreHandler(BaseHTTPRequestHandler):
                 account_id = query.get("account_id", [""])[0].strip()
                 if account_id:
                     self.service.require_account(account_id)
+                consumer_id = query.get("consumer_id", [""])[0].strip()
                 limit = bounded_int(query.get("limit", [""])[0], "limit", default=50, low=1, high=200)
                 timeout = bounded_int(query.get("timeout", [""])[0], "timeout", default=0, low=0, high=30)
                 after = query.get("after", ["0"])[0] or "0"
                 deadline = time.monotonic() + timeout
                 while True:
                     try:
-                        page = self.service.store.poll_events(after=after, limit=limit, account_id=account_id)
+                        page = self.service.store.poll_events(after=after, limit=limit, account_id=account_id, consumer_id=consumer_id)
                     except StoreError as exc:
                         raise ApiError(exc.status, exc.code, str(exc), exc.details) from exc
                     if page["events"] or timeout == 0 or time.monotonic() >= deadline:
@@ -1049,6 +1050,16 @@ class CoreHandler(BaseHTTPRequestHandler):
                 output = self.service.store.get_checkpoint(consumer_id)
                 if output is None:
                     raise ApiError(404, "checkpoint_not_found", f"No checkpoint found for consumer {consumer_id}")
+                self._json(200, output)
+                return
+            if path.startswith("/v1/consumers/") and path.endswith("/bootstrap"):
+                raw_consumer_id = path[len("/v1/consumers/"):-len("/bootstrap")].strip("/")
+                consumer_id = unquote(raw_consumer_id)
+                if not consumer_id:
+                    raise ApiError(400, "invalid_request", "consumer_id is required")
+                output = self.service.store.get_bootstrap_provenance(consumer_id)
+                if output is None:
+                    raise ApiError(404, "bootstrap_not_found", f"No bootstrap record found for consumer {consumer_id}")
                 self._json(200, output)
                 return
             avatar_prefix = "/v1/avatar/"
@@ -1191,6 +1202,46 @@ class CoreHandler(BaseHTTPRequestHandler):
                         cursor_val,
                         last_event_id=last_event_id,
                         subscription_account_id=subscription_account_id,
+                    )
+                except StoreError as exc:
+                    raise ApiError(exc.status, exc.code, str(exc), exc.details) from exc
+                self._json(200, output)
+                return
+            if path == "/v1/consumers/bootstrap":
+                consumer_id = required_text(payload, "consumer_id")
+                mode = str(payload.get("mode") or "at_head").strip()
+                window = payload.get("window")
+                if window is None and payload.get("window_size") is not None:
+                    window = {"events": int(payload["window_size"])}
+                operator_token = str(payload.get("operator_token") or "").strip()
+                try:
+                    output = self.service.store.bootstrap_consumer(
+                        consumer_id,
+                        mode=mode,
+                        window=window,
+                        operator_token=operator_token,
+                    )
+                except StoreError as exc:
+                    raise ApiError(exc.status, exc.code, str(exc), exc.details) from exc
+                self._json(200, output)
+                return
+            if path == "/v1/consumers/rebootstrap":
+                consumer_id = required_text(payload, "consumer_id")
+                mode = str(payload.get("mode") or "bounded_window").strip()
+                window = payload.get("window")
+                if window is None and payload.get("window_size") is not None:
+                    window = {"events": int(payload["window_size"])}
+                operator_token = str(payload.get("operator_token") or "").strip()
+                quiescence_evidence = str(payload.get("quiescence_evidence") or payload.get("quiesced_evidence") or "").strip()
+                reason = str(payload.get("reason") or "").strip()
+                try:
+                    output = self.service.store.rebootstrap_consumer(
+                        consumer_id,
+                        mode=mode,
+                        window=window,
+                        operator_token=operator_token,
+                        quiescence_evidence=quiescence_evidence,
+                        reason=reason,
                     )
                 except StoreError as exc:
                     raise ApiError(exc.status, exc.code, str(exc), exc.details) from exc

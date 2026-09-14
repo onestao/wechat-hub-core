@@ -75,6 +75,74 @@ def parse_json(value: str | None, default: Any) -> Any:
         return default
 
 
+REGISTERED_CONSUMERS: set[str] = {
+    "wechat-console",
+    "wechat-agent",
+    "efb-linux-wechat:wechat.linux",
+}
+LEGACY_CONSUMERS: set[str] = {
+    "wechat-console",
+    "wechat-agent",
+}
+
+
+def find_governance_config_path() -> Path | None:
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / "release" / "required-consumers.production.json"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def get_registered_consumers() -> set[str]:
+    registered = set(REGISTERED_CONSUMERS)
+    config_path = find_governance_config_path()
+    if config_path and config_path.is_file():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for entry in data.get("consumer_registry", []):
+                cid = str(entry.get("consumer_id") or "").strip()
+                if cid:
+                    registered.add(cid)
+        except Exception:
+            pass
+    return registered
+
+
+def is_registered_consumer(consumer_id: str) -> bool:
+    cid = str(consumer_id or "").strip()
+    if not cid:
+        return False
+    if cid.startswith("test-") or cid.startswith("disposable-") or cid.startswith("mock-"):
+        return True
+    return cid in get_registered_consumers()
+
+
+def is_legacy_consumer(consumer_id: str) -> bool:
+    cid = str(consumer_id or "").strip()
+    return cid in LEGACY_CONSUMERS or cid.startswith("test-") or cid.startswith("disposable-") or cid.startswith("mock-")
+
+
+def get_current_required_consumers() -> set[str]:
+    required = {"wechat-console"}
+    config_path = find_governance_config_path()
+    if config_path and config_path.is_file():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            sets = data.get("consumer_sets", {})
+            current_live = sets.get("current_live", {})
+            ids = current_live.get("consumer_ids", [])
+            if ids:
+                return {str(x).strip() for x in ids if str(x).strip()}
+        except Exception:
+            pass
+    return required
+
+
+
 def digest(value: Any) -> str:
     return hashlib.sha256(compact_json(value).encode("utf-8")).hexdigest()
 
@@ -427,8 +495,32 @@ class CoreStore:
                     processed_through_cursor INTEGER NOT NULL,
                     last_event_id TEXT NOT NULL DEFAULT '',
                     subscription_account_id TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    bootstrap_mode TEXT NOT NULL DEFAULT 'legacy',
+                    bootstrap_source TEXT NOT NULL DEFAULT 'legacy',
+                    bootstrap_at TEXT NOT NULL DEFAULT '',
+                    initial_cursor INTEGER NOT NULL DEFAULT 0,
+                    window_spec_json TEXT NOT NULL DEFAULT '{}'
                 );
+
+                CREATE TABLE IF NOT EXISTS consumer_bootstrap_audit (
+                    audit_id TEXT PRIMARY KEY,
+                    consumer_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    previous_cursor INTEGER,
+                    previous_last_event_id TEXT NOT NULL DEFAULT '',
+                    previous_bootstrap_mode TEXT NOT NULL DEFAULT '',
+                    previous_bootstrap_at TEXT NOT NULL DEFAULT '',
+                    new_initial_cursor INTEGER NOT NULL,
+                    new_bootstrap_mode TEXT NOT NULL,
+                    new_bootstrap_at TEXT NOT NULL,
+                    window_spec_json TEXT NOT NULL DEFAULT '{}',
+                    operator_token TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    quiescence_evidence TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_bootstrap_audit_consumer ON consumer_bootstrap_audit(consumer_id, created_at);
 
                 CREATE TABLE IF NOT EXISTS outbox (
                     send_id TEXT PRIMARY KEY,
@@ -519,6 +611,7 @@ class CoreStore:
                 """
             )
             self._migrate_identity_v2_columns(conn)
+            self._migrate_consumer_bootstrap(conn)
 
     def _migrate_identity_v2_columns(self, conn: sqlite3.Connection) -> None:
         """Additive identity v2 ownership columns on all business tables.
@@ -570,6 +663,19 @@ class CoreStore:
             ON contacts(wechat_identity_uuid, member_id)
             """
         )
+
+    def _migrate_consumer_bootstrap(self, conn: sqlite3.Connection) -> None:
+        cp_columns = {row[1] for row in conn.execute("PRAGMA table_info(consumer_checkpoints)")}
+        if "bootstrap_mode" not in cp_columns:
+            conn.execute("ALTER TABLE consumer_checkpoints ADD COLUMN bootstrap_mode TEXT NOT NULL DEFAULT 'legacy'")
+        if "bootstrap_source" not in cp_columns:
+            conn.execute("ALTER TABLE consumer_checkpoints ADD COLUMN bootstrap_source TEXT NOT NULL DEFAULT 'legacy'")
+        if "bootstrap_at" not in cp_columns:
+            conn.execute("ALTER TABLE consumer_checkpoints ADD COLUMN bootstrap_at TEXT NOT NULL DEFAULT ''")
+        if "initial_cursor" not in cp_columns:
+            conn.execute("ALTER TABLE consumer_checkpoints ADD COLUMN initial_cursor INTEGER NOT NULL DEFAULT 0")
+        if "window_spec_json" not in cp_columns:
+            conn.execute("ALTER TABLE consumer_checkpoints ADD COLUMN window_spec_json TEXT NOT NULL DEFAULT '{}'")
 
     @staticmethod
     def _message_migration_score(row: sqlite3.Row) -> tuple[int, int, int]:
@@ -1736,7 +1842,14 @@ class CoreStore:
         media = [dict(row) for row in rows]
         return {"wechat_identity_uuid": str(wechat_identity_uuid), "media": media}
 
-    def poll_events(self, *, after: str, limit: int, account_id: str = "") -> dict[str, Any]:
+    def poll_events(
+        self,
+        *,
+        after: str,
+        limit: int,
+        account_id: str = "",
+        consumer_id: str = "",
+    ) -> dict[str, Any]:
         try:
             cursor = int(after or "0")
         except ValueError as exc:
@@ -1744,10 +1857,38 @@ class CoreStore:
         if cursor < 0:
             raise StoreError("invalid_cursor", "after must not be negative", details={"field": "after"})
         limit = max(1, min(int(limit), 200))
+
+        cid = str(consumer_id or "").strip()
         with self.connection() as conn:
             head_row = conn.execute("SELECT COALESCE(MAX(cursor), 0), COALESCE(MIN(cursor), 0) FROM events").fetchone()
             stream_head_cursor = int(head_row[0] or 0)
             retention_floor_cursor = int(head_row[1] or 0)
+
+            if cid:
+                if not is_registered_consumer(cid):
+                    raise StoreError(
+                        "consumer_not_registered",
+                        f"Consumer {cid!r} is not registered in consumer_registry",
+                        status=400,
+                        details={"consumer_id": cid},
+                    )
+                cp_row = conn.execute("SELECT * FROM consumer_checkpoints WHERE consumer_id=?", (cid,)).fetchone()
+                if cp_row is None:
+                    raise StoreError(
+                        "missing_bootstrap_provenance",
+                        f"Consumer {cid!r} has not executed governed bootstrap. Cold bootstrap at cursor 0 is prohibited.",
+                        status=400,
+                        details={"consumer_id": cid},
+                    )
+                bootstrap_mode = str(cp_row["bootstrap_mode"] or "")
+                initial_cursor = int(cp_row["initial_cursor"] or 0)
+                if bootstrap_mode != "legacy" and cursor < initial_cursor:
+                    raise StoreError(
+                        "poll_below_initial_cursor",
+                        f"Requested after cursor {cursor} is below server-assigned initial cursor {initial_cursor}",
+                        status=400,
+                        details={"requested_cursor": cursor, "initial_cursor": initial_cursor, "consumer_id": cid},
+                    )
 
             statement = "SELECT * FROM events WHERE cursor>? AND cursor<=?"
             args: list[Any] = [cursor, stream_head_cursor]
@@ -1806,6 +1947,8 @@ class CoreStore:
         cid = str(consumer_id or "").strip()
         if not cid:
             raise StoreError("invalid_request", "consumer_id must be a non-empty string", details={"field": "consumer_id"})
+        if not is_registered_consumer(cid):
+            raise StoreError("consumer_not_registered", f"Consumer {cid!r} is not registered in consumer_registry", status=400, details={"consumer_id": cid})
         try:
             cursor_val = int(processed_through_cursor)
         except (ValueError, TypeError) as exc:
@@ -1831,12 +1974,38 @@ class CoreStore:
                 )
 
             existing = conn.execute(
-                "SELECT processed_through_cursor, last_event_id, subscription_account_id FROM consumer_checkpoints WHERE consumer_id=?",
+                "SELECT * FROM consumer_checkpoints WHERE consumer_id=?",
                 (cid,),
             ).fetchone()
 
-            if existing is not None:
+            if existing is None:
+                if not is_legacy_consumer(cid):
+                    raise StoreError(
+                        "checkpoint_before_bootstrap",
+                        f"Consumer {cid!r} must execute governed bootstrap before posting checkpoints",
+                        status=400,
+                        details={"consumer_id": cid},
+                    )
+                bootstrap_mode = "legacy"
+                bootstrap_source = "legacy_checkpoint"
+                bootstrap_at = now
+                initial_cursor = 0
+            else:
                 prev_cursor = int(existing["processed_through_cursor"])
+                init_cursor = int(existing["initial_cursor"] or 0)
+                bootstrap_mode = str(existing["bootstrap_mode"] or "legacy")
+                bootstrap_source = str(existing["bootstrap_source"] or "legacy")
+                bootstrap_at = str(existing["bootstrap_at"] or "")
+                initial_cursor = init_cursor
+
+                if bootstrap_mode != "legacy" and cursor_val < initial_cursor:
+                    raise StoreError(
+                        "cursor_below_initial_cursor",
+                        f"processed_through_cursor {cursor_val} cannot be below server-assigned initial cursor {initial_cursor}",
+                        status=400,
+                        details={"processed_through_cursor": cursor_val, "initial_cursor": initial_cursor},
+                    )
+
                 if cursor_val < prev_cursor:
                     raise StoreError(
                         "cursor_regression",
@@ -1877,15 +2046,16 @@ class CoreStore:
             conn.execute(
                 """
                 INSERT INTO consumer_checkpoints (
-                    consumer_id, processed_through_cursor, last_event_id, subscription_account_id, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    consumer_id, processed_through_cursor, last_event_id, subscription_account_id, updated_at,
+                    bootstrap_mode, bootstrap_source, bootstrap_at, initial_cursor, window_spec_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(consumer_id) DO UPDATE SET
                     processed_through_cursor=excluded.processed_through_cursor,
                     last_event_id=excluded.last_event_id,
                     subscription_account_id=excluded.subscription_account_id,
                     updated_at=excluded.updated_at
                 """,
-                (cid, cursor_val, last_event_id, subscription_account_id, now),
+                (cid, cursor_val, last_event_id, subscription_account_id, now, bootstrap_mode, bootstrap_source, bootstrap_at, initial_cursor, '{}'),
             )
 
         return {
@@ -1895,6 +2065,299 @@ class CoreStore:
             "stream_head_cursor": stream_head,
             "retention_floor_cursor": retention_floor,
             "idempotent": False,
+        }
+
+    def bootstrap_consumer(
+        self,
+        consumer_id: str,
+        *,
+        mode: str = "at_head",
+        window: Mapping[str, Any] | None = None,
+        operator_token: str = "",
+    ) -> dict[str, Any]:
+        cid = str(consumer_id or "").strip()
+        if not cid:
+            raise StoreError("invalid_request", "consumer_id is required", status=400, details={"field": "consumer_id"})
+        if not is_registered_consumer(cid):
+            raise StoreError("consumer_not_registered", f"consumer_id {cid!r} is not registered in consumer_registry", status=400, details={"consumer_id": cid})
+
+        mode_str = str(mode or "").strip()
+        if mode_str == "explicit_historical_replay":
+            raise StoreError("mode_requires_maintenance_window", "explicit_historical_replay requires offline maintenance window authorization", status=400)
+        if mode_str not in ("at_head", "bounded_window"):
+            raise StoreError("invalid_bootstrap_mode", f"Unsupported bootstrap mode: {mode_str!r}", status=400)
+
+        window_dict = dict(window or {})
+        if mode_str == "bounded_window":
+            if not operator_token or not str(operator_token).strip():
+                raise StoreError("mode_requires_authorization", "bounded_window mode requires a non-empty operator_token", status=400)
+            if not window_dict or ("events" not in window_dict and "since" not in window_dict):
+                raise StoreError("invalid_window_spec", "bounded_window requires window specification with 'events' or 'since'", status=400)
+            if "events" in window_dict:
+                try:
+                    if int(window_dict["events"]) <= 0:
+                        raise ValueError()
+                except (ValueError, TypeError):
+                    raise StoreError("invalid_window_spec", "events count must be a positive integer", status=400)
+
+        now = utc_now()
+        with self.connection() as conn:
+            head_row = conn.execute("SELECT COALESCE(MAX(cursor), 0), COALESCE(MIN(cursor), 0) FROM events").fetchone()
+            stream_head = int(head_row[0] or 0)
+            retention_floor = int(head_row[1] or 0)
+
+            existing = conn.execute("SELECT * FROM consumer_checkpoints WHERE consumer_id = ?", (cid,)).fetchone()
+            if existing is not None:
+                ex_mode = str(existing["bootstrap_mode"] or "")
+                ex_init = int(existing["initial_cursor"] or 0)
+                ex_cursor = int(existing["processed_through_cursor"])
+                if ex_mode == mode_str:
+                    return {
+                        "ok": True,
+                        "consumer_id": cid,
+                        "initial_cursor": ex_init,
+                        "processed_through_cursor": ex_cursor,
+                        "mode": ex_mode,
+                        "stream_head_cursor": stream_head,
+                        "retention_floor_cursor": retention_floor,
+                        "bootstrap_at": str(existing["bootstrap_at"] or ""),
+                        "idempotent": True,
+                    }
+                raise StoreError("already_bootstrapped", f"Consumer {cid!r} is already bootstrapped in mode {ex_mode!r}. Re-bootstrap requires governed rebootstrap transition.", status=400)
+
+            if mode_str == "at_head":
+                initial_cursor = stream_head
+            elif mode_str == "bounded_window":
+                if "events" in window_dict:
+                    count = int(window_dict["events"])
+                    initial_cursor = max(retention_floor, stream_head - count)
+                else:
+                    since_ts = str(window_dict["since"])
+                    r = conn.execute("SELECT MIN(cursor) FROM events WHERE occurred_at >= ?", (since_ts,)).fetchone()
+                    initial_cursor = int(r[0]) if (r and r[0] is not None) else stream_head
+                    initial_cursor = max(retention_floor, initial_cursor)
+            initial_cursor = min(stream_head, max(0, initial_cursor))
+
+            audit_id = f"audit-{uuid.uuid4().hex}"
+            conn.execute(
+                """
+                INSERT INTO consumer_checkpoints (
+                    consumer_id, processed_through_cursor, last_event_id, subscription_account_id, updated_at,
+                    bootstrap_mode, bootstrap_source, bootstrap_at, initial_cursor, window_spec_json
+                ) VALUES (?, ?, '', '', ?, ?, 'governed_bootstrap', ?, ?, ?)
+                """,
+                (cid, initial_cursor, now, mode_str, now, initial_cursor, compact_json(window_dict)),
+            )
+            conn.execute(
+                """
+                INSERT INTO consumer_bootstrap_audit (
+                    audit_id, consumer_id, action, previous_cursor, previous_last_event_id,
+                    previous_bootstrap_mode, previous_bootstrap_at, new_initial_cursor,
+                    new_bootstrap_mode, new_bootstrap_at, window_spec_json, operator_token, reason, created_at
+                ) VALUES (?, ?, 'bootstrap', NULL, '', '', '', ?, ?, ?, ?, ?, 'initial_bootstrap', ?)
+                """,
+                (audit_id, cid, initial_cursor, mode_str, now, compact_json(window_dict), operator_token, now),
+            )
+
+        return {
+            "ok": True,
+            "consumer_id": cid,
+            "initial_cursor": initial_cursor,
+            "processed_through_cursor": initial_cursor,
+            "mode": mode_str,
+            "stream_head_cursor": stream_head,
+            "retention_floor_cursor": retention_floor,
+            "bootstrap_at": now,
+            "idempotent": False,
+        }
+
+    def rebootstrap_consumer(
+        self,
+        consumer_id: str,
+        *,
+        mode: str = "bounded_window",
+        window: Mapping[str, Any] | None = None,
+        operator_token: str = "",
+        quiescence_evidence: str = "",
+        quiesced_evidence: str = "",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        cid = str(consumer_id or "").strip()
+        if not cid:
+            raise StoreError("invalid_request", "consumer_id is required", status=400, details={"field": "consumer_id"})
+        if not is_registered_consumer(cid):
+            raise StoreError("consumer_not_registered", f"consumer_id {cid!r} is not registered in consumer_registry", status=400, details={"consumer_id": cid})
+
+        current_required = get_current_required_consumers()
+        if cid in current_required:
+            raise StoreError(
+                "cannot_rebootstrap_required_consumer",
+                f"Consumer {cid!r} is in current required consumer set ({sorted(current_required)}) and cannot be re-bootstrapped",
+                status=403,
+                details={"consumer_id": cid, "required_set": sorted(current_required)},
+            )
+
+        token = str(operator_token or "").strip()
+        if not token:
+            raise StoreError("rebootstrap_requires_authorization", "Rebootstrap requires a non-empty operator_token", status=401, details={"consumer_id": cid})
+
+        quiesced = str(quiescence_evidence or quiesced_evidence or "").strip()
+        if not quiesced:
+            raise StoreError(
+                "quiescence_evidence_required",
+                "Rebootstrap requires explicit operator quiescence evidence (e.g. 'service_stopped')",
+                status=400,
+                details={"consumer_id": cid},
+            )
+
+        mode_str = str(mode or "").strip()
+        if mode_str == "explicit_historical_replay":
+            raise StoreError("mode_requires_maintenance_window", "explicit_historical_replay requires offline maintenance window authorization", status=400)
+        if mode_str not in ("at_head", "bounded_window"):
+            raise StoreError("invalid_bootstrap_mode", f"Unsupported bootstrap mode: {mode_str!r}", status=400)
+
+        window_dict = dict(window or {})
+        if mode_str == "bounded_window":
+            if not window_dict or ("events" not in window_dict and "since" not in window_dict):
+                raise StoreError("invalid_window_spec", "bounded_window requires window specification with 'events' or 'since'", status=400)
+            if "events" in window_dict:
+                try:
+                    if int(window_dict["events"]) <= 0:
+                        raise ValueError()
+                except (ValueError, TypeError):
+                    raise StoreError("invalid_window_spec", "events count must be a positive integer", status=400)
+
+        now = utc_now()
+        with self.connection() as conn:
+            head_row = conn.execute("SELECT COALESCE(MAX(cursor), 0), COALESCE(MIN(cursor), 0) FROM events").fetchone()
+            stream_head = int(head_row[0] or 0)
+            retention_floor = int(head_row[1] or 0)
+
+            existing = conn.execute("SELECT * FROM consumer_checkpoints WHERE consumer_id = ?", (cid,)).fetchone()
+            if existing is None:
+                raise StoreError("consumer_not_found", f"Consumer {cid!r} does not have an existing checkpoint to re-bootstrap", status=404)
+
+            prev_cursor = int(existing["processed_through_cursor"])
+            prev_last_event_id = str(existing["last_event_id"] or "")
+            prev_mode = str(existing["bootstrap_mode"] or "")
+            prev_at = str(existing["bootstrap_at"] or "")
+
+            if mode_str == "at_head":
+                new_initial_cursor = stream_head
+            elif mode_str == "bounded_window":
+                if "events" in window_dict:
+                    count = int(window_dict["events"])
+                    new_initial_cursor = max(retention_floor, stream_head - count)
+                else:
+                    since_ts = str(window_dict["since"])
+                    r = conn.execute("SELECT MIN(cursor) FROM events WHERE occurred_at >= ?", (since_ts,)).fetchone()
+                    new_initial_cursor = int(r[0]) if (r and r[0] is not None) else stream_head
+                    new_initial_cursor = max(retention_floor, new_initial_cursor)
+            new_initial_cursor = min(stream_head, max(0, new_initial_cursor))
+
+            if prev_cursor == new_initial_cursor and prev_mode == mode_str:
+                return {
+                    "ok": True,
+                    "consumer_id": cid,
+                    "initial_cursor": new_initial_cursor,
+                    "processed_through_cursor": new_initial_cursor,
+                    "mode": mode_str,
+                    "previous_cursor": prev_cursor,
+                    "previous_checkpoint": prev_cursor,
+                    "stream_head_cursor": stream_head,
+                    "retention_floor_cursor": retention_floor,
+                    "bootstrap_at": prev_at,
+                    "quiescence_evidence": quiesced,
+                    "idempotent": True,
+                }
+
+            audit_id = f"audit-{uuid.uuid4().hex}"
+            conn.execute(
+                """
+                INSERT INTO consumer_bootstrap_audit (
+                    audit_id, consumer_id, action, previous_cursor, previous_last_event_id,
+                    previous_bootstrap_mode, previous_bootstrap_at, new_initial_cursor,
+                    new_bootstrap_mode, new_bootstrap_at, window_spec_json, operator_token, reason, quiescence_evidence, created_at
+                ) VALUES (?, ?, 'rebootstrap', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    audit_id, cid, prev_cursor, prev_last_event_id, prev_mode, prev_at,
+                    new_initial_cursor, mode_str, now, compact_json(window_dict), token, str(reason or "governed_rebootstrap"), quiesced, now,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE consumer_checkpoints SET
+                    processed_through_cursor = ?,
+                    last_event_id = '',
+                    bootstrap_mode = ?,
+                    bootstrap_source = 'governed_rebootstrap',
+                    bootstrap_at = ?,
+                    initial_cursor = ?,
+                    window_spec_json = ?,
+                    updated_at = ?
+                WHERE consumer_id = ?
+                """,
+                (new_initial_cursor, mode_str, now, new_initial_cursor, compact_json(window_dict), now, cid),
+            )
+
+        return {
+            "ok": True,
+            "consumer_id": cid,
+            "initial_cursor": new_initial_cursor,
+            "processed_through_cursor": new_initial_cursor,
+            "mode": mode_str,
+            "previous_cursor": prev_cursor,
+            "previous_checkpoint": prev_cursor,
+            "stream_head_cursor": stream_head,
+            "retention_floor_cursor": retention_floor,
+            "bootstrap_at": now,
+            "quiescence_evidence": quiesced,
+            "idempotent": False,
+        }
+
+    def get_bootstrap_provenance(self, consumer_id: str) -> dict[str, Any] | None:
+        cid = str(consumer_id or "").strip()
+        if not cid:
+            return None
+        with self.connection() as conn:
+            row = conn.execute("SELECT * FROM consumer_checkpoints WHERE consumer_id = ?", (cid,)).fetchone()
+            if row is None:
+                return None
+            head_row = conn.execute("SELECT COALESCE(MAX(cursor), 0), COALESCE(MIN(cursor), 0) FROM events").fetchone()
+            stream_head = int(head_row[0] or 0)
+            retention_floor = int(head_row[1] or 0)
+
+            audit_rows = conn.execute(
+                "SELECT audit_id, action, previous_cursor, new_initial_cursor, new_bootstrap_mode, operator_token, reason, quiescence_evidence, created_at FROM consumer_bootstrap_audit WHERE consumer_id = ? ORDER BY created_at ASC",
+                (cid,),
+            ).fetchall()
+            audit_history = [
+                {
+                    "audit_id": str(ar["audit_id"]),
+                    "action": str(ar["action"]),
+                    "previous_cursor": ar["previous_cursor"],
+                    "previous_checkpoint": ar["previous_cursor"],
+                    "new_initial_cursor": int(ar["new_initial_cursor"]),
+                    "new_bootstrap_mode": str(ar["new_bootstrap_mode"]),
+                    "operator_token": str(ar["operator_token"]),
+                    "reason": str(ar["reason"]),
+                    "quiescence_evidence": str(ar["quiescence_evidence"] or ""),
+                    "created_at": str(ar["created_at"]),
+                }
+                for ar in audit_rows
+            ]
+
+        return {
+            "consumer_id": row["consumer_id"],
+            "initial_cursor": int(row["initial_cursor"] or 0),
+            "processed_through_cursor": int(row["processed_through_cursor"]),
+            "bootstrap_mode": str(row["bootstrap_mode"] or "legacy"),
+            "bootstrap_source": str(row["bootstrap_source"] or "legacy"),
+            "bootstrap_at": str(row["bootstrap_at"] or ""),
+            "stream_head_cursor": stream_head,
+            "retention_floor_cursor": retention_floor,
+            "audit_history": audit_history,
         }
 
     def get_checkpoint(self, consumer_id: str) -> dict[str, Any] | None:
