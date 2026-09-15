@@ -236,6 +236,10 @@ paths:
           headers:
             X-Media-Id:
               schema: {type: string}
+            X-Media-Role:
+              schema: {type: string, enum: [original, thumbnail]}
+            X-Media-Status:
+              schema: {type: string}
           content:
             application/octet-stream:
               schema: {type: string, contentEncoding: binary}
@@ -515,6 +519,8 @@ components:
         media_id: {type: string}
         filename: {type: string}
         mime_type: {type: string}
+        media_role: {type: string, enum: [original, thumbnail]}
+        media_status: {type: string}
         target_message_id: {type: string}
         substitutions: {type: array, items: {type: object, additionalProperties: true}}
         attributes: {type: object, additionalProperties: true}

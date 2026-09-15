@@ -290,6 +290,13 @@ def _normalized_message(
         "source_real_sender_id": _value(row, "real_sender_id", None),
         "direction_inferred_from": "group_sender_prefix" if sender_hint else "origin_source",
     }
+    if media:
+        vendor_specific["media"] = {
+            "role": media["role"],
+            "status": media["status"],
+            "original_media_id": media["media_id"] if media["role"] == "original" else "",
+            "thumbnail_media_id": media["media_id"] if media["role"] == "thumbnail" else "",
+        }
     attributes = {
         key: value
         for key, value in {
@@ -319,6 +326,8 @@ def _normalized_message(
                 "media_id": media["media_id"],
                 "filename": media["filename"],
                 "mime_type": media["mime_type"],
+                "media_role": media["role"],
+                "media_status": media["status"],
             }
         )
     return normalized
@@ -448,7 +457,10 @@ def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
         if _table(conn, "message_media"):
             media_rows = conn.execute("SELECT * FROM message_media WHERE status='ready'").fetchall()
             for row in media_rows:
-                path = _resolve_media_path(account, str(_value(row, "media_path") or _value(row, "thumb_path")))
+                raw_media_path = str(_value(row, "media_path") or "")
+                raw_thumb_path = str(_value(row, "thumb_path") or "")
+                role = "original" if raw_media_path else "thumbnail"
+                path = _resolve_media_path(account, raw_media_path or raw_thumb_path)
                 if not path:
                     continue
                 media_id = str(_value(row, "message_uid"))
@@ -467,6 +479,7 @@ def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
                         "mime_type": mime_type,
                         "local_path": str(path),
                         "disposition": "inline",
+                        "role": role,
                         "status": "ready",
                     }
                 )
@@ -474,6 +487,8 @@ def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
                     "media_id": media_id,
                     "filename": path.name,
                     "mime_type": mime_type,
+                    "role": role,
+                    "status": "ready",
                 }
                 summary["media"] += 1
         message_rows = conn.execute("SELECT * FROM messages ORDER BY create_time, local_id").fetchall()

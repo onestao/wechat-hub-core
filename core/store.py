@@ -463,6 +463,7 @@ class CoreStore:
                     mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
                     local_path TEXT NOT NULL,
                     disposition TEXT NOT NULL DEFAULT 'inline',
+                    role TEXT NOT NULL DEFAULT 'original',
                     status TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     digest TEXT NOT NULL,
@@ -602,6 +603,9 @@ class CoreStore:
                 conn.execute("ALTER TABLE messages ADD COLUMN source_local_id TEXT NOT NULL DEFAULT ''")
             if "source_message_table" not in message_columns:
                 conn.execute("ALTER TABLE messages ADD COLUMN source_message_table TEXT NOT NULL DEFAULT ''")
+            media_columns = {row[1] for row in conn.execute("PRAGMA table_info(media)")}
+            if "role" not in media_columns:
+                conn.execute("ALTER TABLE media ADD COLUMN role TEXT NOT NULL DEFAULT 'original'")
             self._migrate_message_source_identity(conn)
             conn.execute(
                 """
@@ -1440,6 +1444,7 @@ class CoreStore:
             "mime_type": str(media.get("mime_type") or "application/octet-stream"),
             "local_path": str(media["local_path"]),
             "disposition": str(media.get("disposition") or "inline"),
+            "role": str(media.get("role") or "original"),
             "status": str(media.get("status") or "ready"),
         }
         value_digest = digest(value)
@@ -1448,17 +1453,19 @@ class CoreStore:
             before = conn.execute("SELECT digest, status FROM media WHERE account_id=? AND media_id=?", (account_id, media_id)).fetchone()
             conn.execute(
                 """
-                INSERT INTO media (account_id, media_id, instance_uuid, wechat_identity_uuid, filename, mime_type, local_path, disposition, status, updated_at, digest)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO media (account_id, media_id, instance_uuid, wechat_identity_uuid, filename, mime_type, local_path, disposition, role, status, updated_at, digest)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, media_id) DO UPDATE SET
                     filename=excluded.filename, mime_type=excluded.mime_type, local_path=excluded.local_path,
-                    disposition=excluded.disposition, status=excluded.status, updated_at=excluded.updated_at, digest=excluded.digest,
+                    disposition=excluded.disposition, role=excluded.role, status=excluded.status,
+                    updated_at=excluded.updated_at, digest=excluded.digest,
                     instance_uuid=CASE WHEN media.instance_uuid<>'' THEN media.instance_uuid ELSE excluded.instance_uuid END,
                     wechat_identity_uuid=CASE WHEN media.wechat_identity_uuid<>'' THEN media.wechat_identity_uuid ELSE excluded.wechat_identity_uuid END
                 """,
                 (
                     account_id, media_id, str(gate["instance"]["instance_uuid"]), str(gate["stamp_identity"]),
-                    value["filename"], value["mime_type"], value["local_path"], value["disposition"], value["status"], utc_now(), value_digest,
+                    value["filename"], value["mime_type"], value["local_path"], value["disposition"],
+                    value["role"], value["status"], utc_now(), value_digest,
                 ),
             )
             changed = before is None or before["digest"] != value_digest

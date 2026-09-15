@@ -382,7 +382,12 @@ def choose_dat(dat_files: list[Path], prefer_thumb: bool) -> Path | None:
         stem = path.stem
         if not stem.endswith("_t") and not stem.endswith("_h"):
             return path
-    return dat_files[0]
+    if prefer_thumb:
+        return dat_files[0]
+    # A thumbnail is a distinct media role. When full-image mode is active,
+    # keep the message pending instead of publishing low-resolution bytes as
+    # if they were the original image.
+    return None
 
 
 def find_sticker_cache(wechat_base_dir: Path, media_md5: str) -> Path | None:
@@ -550,14 +555,16 @@ def sync_image(row: sqlite3.Row, args, resource_map: dict[tuple[str, int], str],
     dat_files = find_dat_files(args.wechat_base_dir, chat_username, media_md5)
     selected = choose_dat(dat_files, prefer_thumb=args.prefer_thumbnails)
     if not selected:
+        thumbnail_only = bool(dat_files) and all(path.name.endswith("_t.dat") for path in dat_files)
         return {
             "message_uid": row["message_uid"],
             "chat_username": chat_username,
             "local_id": local_id,
             "media_type": "image",
             "original_md5": media_md5,
-            "status": "missing_file",
-            "error": "local .dat cache not found",
+            "source_path": str(dat_files[0]) if thumbnail_only else None,
+            "status": "original_pending" if thumbnail_only else "missing_file",
+            "error": "only thumbnail cache is available" if thumbnail_only else "local .dat cache not found",
         }
     data, fmt = decrypt_dat(selected, cfg.get("image_aes_key"), int(cfg.get("image_xor_key", 0x88)))
     if not data or not fmt:

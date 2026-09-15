@@ -1091,6 +1091,8 @@ class CoreHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(content)))
                 self.send_header("Content-Disposition", f'{media["disposition"]}; filename="{filename}"')
                 self.send_header("X-Media-Id", media_id)
+                self.send_header("X-Media-Role", str(media.get("role") or "original"))
+                self.send_header("X-Media-Status", str(media.get("status") or ""))
                 self.end_headers()
                 self.wfile.write(content)
                 return
