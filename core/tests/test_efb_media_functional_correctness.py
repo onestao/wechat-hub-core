@@ -16,6 +16,7 @@ if str(CORE_ROOT) not in sys.path:
     sys.path.insert(0, str(CORE_ROOT))
 
 from memory import media_sync  # noqa: E402
+from core.normalize import _normalized_message  # noqa: E402
 
 
 class EFBMediaFunctionalCorrectnessTest(unittest.TestCase):
@@ -80,6 +81,36 @@ class EFBMediaFunctionalCorrectnessTest(unittest.TestCase):
         self.assertEqual(result["status"], "decode_failed")
         self.assertTrue(str(result["source_path"]).endswith("_h.dat"))
         self.assertNotEqual(result["source_path"], str(paths[0]))
+
+    def test_f2_pending_original_reference_is_preserved_in_message_contract(self) -> None:
+        normalized = _normalized_message(
+            "account-1",
+            {
+                "message_uid": "message-1",
+                "chat_username": "chat-1",
+                "type_label": "image",
+                "message_content": "",
+                "compress_content": "",
+                "source": "",
+                "origin_source": 0,
+                "create_time": 1,
+            },
+            {},
+            media={
+                "media_id": "message-1",
+                "filename": "message-1",
+                "mime_type": "application/octet-stream",
+                "role": "original",
+                "status": "original_pending",
+            },
+        )
+        self.assertEqual(normalized["media_id"], "message-1")
+        self.assertEqual(normalized["media_role"], "original")
+        self.assertEqual(normalized["media_status"], "original_pending")
+        self.assertEqual(
+            normalized["vendor_specific"]["media"]["original_media_id"],
+            "message-1",
+        )
 
 
 if __name__ == "__main__":

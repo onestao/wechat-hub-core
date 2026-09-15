@@ -455,22 +455,31 @@ def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
             summary["chats"] += 1
         media_by_message: dict[str, dict[str, str]] = {}
         if _table(conn, "message_media"):
-            media_rows = conn.execute("SELECT * FROM message_media WHERE status='ready'").fetchall()
+            media_rows = conn.execute("SELECT * FROM message_media").fetchall()
             for row in media_rows:
-                raw_media_path = str(_value(row, "media_path") or "")
-                raw_thumb_path = str(_value(row, "thumb_path") or "")
-                role = "original" if raw_media_path else "thumbnail"
-                path = _resolve_media_path(account, raw_media_path or raw_thumb_path)
-                if not path:
-                    continue
                 media_id = str(_value(row, "message_uid"))
                 if not media_id:
                     continue
+                raw_media_path = str(_value(row, "media_path") or "")
+                raw_thumb_path = str(_value(row, "thumb_path") or "")
+                media_type = str(_value(row, "media_type") or "")
+                role = "original" if raw_media_path or media_type in {"image", "sticker"} else "thumbnail"
+                status = str(_value(row, "status") or "pending")
+                path = _resolve_media_path(account, raw_media_path or raw_thumb_path)
                 mime_type = str(
                     _value(row, "mime_type")
-                    or mimetypes.guess_type(path.name)[0]
+                    or (mimetypes.guess_type(path.name)[0] if path else "")
                     or "application/octet-stream"
                 )
+                media_by_message[media_id] = {
+                    "media_id": media_id,
+                    "filename": path.name if path else media_id,
+                    "mime_type": mime_type,
+                    "role": role,
+                    "status": status,
+                }
+                if status != "ready" or not path:
+                    continue
                 store.upsert_media(
                     {
                         "account_id": account.account_id,
@@ -480,16 +489,9 @@ def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
                         "local_path": str(path),
                         "disposition": "inline",
                         "role": role,
-                        "status": "ready",
+                        "status": status,
                     }
                 )
-                media_by_message[media_id] = {
-                    "media_id": media_id,
-                    "filename": path.name,
-                    "mime_type": mime_type,
-                    "role": role,
-                    "status": "ready",
-                }
                 summary["media"] += 1
         message_rows = conn.execute("SELECT * FROM messages ORDER BY create_time, local_id").fetchall()
         for row in message_rows:
