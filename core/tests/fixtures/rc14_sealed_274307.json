@@ -1,0 +1,55 @@
+{
+  "fixture_id": "RC14_SEALED_274307",
+  "purpose": "Frozen evidence for the single `file`-typed row of the sealed RC.14 post-F3 reprojection census, used to prove the Core projection no longer classifies it as a media message.",
+  "source_census": {
+    "path": "work/rc14-efb-idempotency/tests/fixtures/rc14_post_f3_reprojection_stream.json",
+    "sha256": "697c207f1ceb073c40fa63743efe53216f279a0974bd58af5078d3287373df3c",
+    "description": "RC.14 sealed post-F3 reprojection census: W1 273845..274304, NEW_BUSINESS 274305..274307, W2 274308..274727. Read-only Core HTTP capture. Message text and author identity deliberately excluded.",
+    "rows": 883,
+    "window": [273845, 274727]
+  },
+  "sealed_row": {
+    "cursor": 274307,
+    "event_type": "message.created",
+    "account_id": "f-live-a",
+    "chat_id": "38808757431@chatroom",
+    "message_id": "8745c1a931013b8941a0736d6fb890f1a4129129bd03b2b4842d09f7d5995d79",
+    "type": "file",
+    "direction": "incoming",
+    "media_role": "",
+    "media_status": "",
+    "media_id": ""
+  },
+  "census_invariants": {
+    "message_id_occurrences_in_window": 1,
+    "type_histogram_message_events": {
+      "image": 686,
+      "sticker": 116,
+      "video": 22,
+      "system": 4,
+      "link": 1,
+      "text": 1,
+      "file": 1
+    },
+    "file_typed_rows_in_window": 1
+  },
+  "structural_evidence": {
+    "observed_in": "account staging store `messages` row for message_uid 8745c1a931013b8941a0736d6fb890f1a4129129bd03b2b4842d09f7d5995d79 (chat 38808757431@chatroom, local_id 1040, type_label link_or_file); read once, read-only. The staging store is not part of the protected Core database set.",
+    "upstream_type_label": "link_or_file",
+    "appmsg_type": "57",
+    "appmsg_type_meaning": "quote reply (referenced message), NOT a file transfer",
+    "has_refermsg": true,
+    "appattach_present": true,
+    "appattach_has_attachment_payload": false,
+    "note": "The outer appattach element exists but carries only empty cdnthumbaeskey/aeskey nodes and no totallen/attachid, so there is no attachment to resolve. The message body is deliberately not reproduced here.",
+    "expected_projection_after_fix": "text",
+    "expected_media_reference_after_fix": "none"
+  },
+  "verdicts": {
+    "274307_IS_A_GENUINE_FILE": "NO",
+    "274307_MEDIA_BACKING_FROZEN_IN_FIXTURE": "NO",
+    "274307_MEDIA_ID_RESOLVABLE": "NOT_PROVABLE_OFFLINE",
+    "274307_CLASSIFIED_AS_NEW_BUSINESS": "YES",
+    "274307_DUPLICATE": "NO"
+  }
+}

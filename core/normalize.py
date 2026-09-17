@@ -258,8 +258,22 @@ def _normalized_message(
     content = str(_value(row, "message_content"))
     compressed = str(_value(row, "compress_content"))
     parts = message_display_parts(content, compressed, raw_type, str(_value(row, "source")))
-    if raw_type == "link_or_file" and parts.get("app_url"):
-        type_name = "link"
+    if raw_type == "link_or_file":
+        # ``link_or_file`` is the upstream staging label for every WeChat local
+        # type 49 ``appmsg``: url shares, file transfers, merged chat records,
+        # quote replies and others.  Only a genuine file transfer carries a
+        # media artifact, and ``file`` is a *media* type for every consumer, so
+        # projecting the rest as ``file`` asks the consumer for a media
+        # reference that can never exist (observed on the production stream:
+        # 110 quote replies and 2 merged chat records were projected as ``file``
+        # and could never be delivered).  Classify from the parsed appmsg
+        # subtype instead of from the absence of a url.
+        if parts.get("app_is_file_attachment"):
+            type_name = "file"
+        elif parts.get("app_url"):
+            type_name = "link"
+        else:
+            type_name = "text"
     sender_hint = str(parts.get("sender_hint") or "")
     try:
         origin_source = int(_value(row, "origin_source", 0) or 0)
@@ -463,7 +477,14 @@ def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
                 raw_media_path = str(_value(row, "media_path") or "")
                 raw_thumb_path = str(_value(row, "thumb_path") or "")
                 media_type = str(_value(row, "media_type") or "")
-                role = "original" if raw_media_path or media_type in {"image", "sticker"} else "thumbnail"
+                if media_type in {"file", "voice"}:
+                    # Neither type has a thumbnail form: the row always
+                    # describes the original artifact, so a not-ready row is a
+                    # pending *original* and must never be labelled a thumbnail
+                    # (nor may a thumbnail ever be published as an original).
+                    role = "original"
+                else:
+                    role = "original" if raw_media_path or media_type in {"image", "sticker"} else "thumbnail"
                 status = str(_value(row, "status") or "pending")
                 path = _resolve_media_path(account, raw_media_path or raw_thumb_path)
                 mime_type = str(

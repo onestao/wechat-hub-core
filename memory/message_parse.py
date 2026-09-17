@@ -9,6 +9,13 @@ import xml.etree.ElementTree as ET
 
 TAG_RE = re.compile(r"<[^>]+>")
 
+# WeChat ``appmsg`` subtype that denotes a real file transfer.  The upstream
+# ``link_or_file`` label is the staging name for *every* local type 49
+# ``appmsg`` -- url shares (5), file transfers (6), merged chat records (19),
+# quote replies (57) and others -- so the subtype is the only reliable way to
+# tell a file apart from the rest.
+APPMSG_FILE_TYPE = "6"
+
 
 def split_group_sender(content: str | None) -> tuple[str, str]:
     if not content:
@@ -108,6 +115,11 @@ def parse_app_message(body: str | None) -> dict:
         "app_name": app_name,
         "app_source_username": source_username,
         "app_id": app_id,
+        # True only for a genuine file transfer.  Callers that project a media
+        # message must gate on this rather than on the absence of a url, or a
+        # quote reply / merged chat record is mistaken for a file and the
+        # consumer is asked for a media reference that can never exist.
+        "app_is_file_attachment": app_type == APPMSG_FILE_TYPE,
     }
 
     refer = appmsg.find("refermsg") if appmsg is not None else None
