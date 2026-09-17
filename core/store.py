@@ -1262,6 +1262,16 @@ class CoreStore:
             output["attributes"] = attributes
         if vendor:
             output["vendor_specific"] = vendor
+        # The media role/status contract is persisted inside vendor_specific.media
+        # (the messages table has no dedicated columns).  Consumers read the
+        # contract at the top level of the message object, so project it here as
+        # well and keep the REST view identical to the event payload view.
+        media = vendor.get("media") if isinstance(vendor, dict) else None
+        if isinstance(media, dict):
+            if media.get("role"):
+                output["media_role"] = media["role"]
+            if media.get("status"):
+                output["media_status"] = media["status"]
         return output
 
     def _reconcile_text_echo(self, conn: sqlite3.Connection, message: dict[str, Any]) -> str:
@@ -1375,6 +1385,25 @@ class CoreStore:
         if source_local_id not in (None, ""):
             value["source_local_id"] = str(source_local_id)
         value["source_message_table"] = str(value["vendor_specific"].get("source_message_table") or "")
+        # The normalizer records the media role/status contract on the message it
+        # hands to the store, and mirrors it into vendor_specific.media.  The
+        # explicit column whitelist above rebuilds the persisted value from
+        # scratch, so without this projection both fields would be silently
+        # dropped from the message object that the event payload and the REST
+        # projection expose.  The keys are only materialized for messages that
+        # actually carry media, so text-only messages keep their previous digest
+        # and are not re-emitted.
+        media_role = str(message.get("media_role") or "")
+        media_status = str(message.get("media_status") or "")
+        if not media_role or not media_status:
+            media = value["vendor_specific"].get("media")
+            if isinstance(media, dict):
+                media_role = media_role or str(media.get("role") or "")
+                media_status = media_status or str(media.get("status") or "")
+        if media_role:
+            value["media_role"] = media_role
+        if media_status:
+            value["media_status"] = media_status
         with self.connection() as conn:
             gate = identity.sync_gate(conn, account_id)
             instance_uuid = str(gate["instance"]["instance_uuid"])
