@@ -2609,6 +2609,41 @@ class CoreStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def send_status(self, send_id: str) -> dict[str, Any] | None:
+        """Authoritative single-send receipt.
+
+        Read path for the Console's convergence reconciliation: the Console must
+        be able to learn the terminal state of a send even when the event stream
+        missed an update, and it must never open Core SQLite directly.
+        """
+
+        with self.connection() as conn:
+            row = conn.execute("SELECT * FROM outbox WHERE send_id=?", (str(send_id or ""),)).fetchone()
+        if row is None:
+            return None
+        receipt = self._receipt(row)
+        details = parse_json(row["details_json"], {})
+        details = details if isinstance(details, dict) else {}
+        receipt["details"] = details
+        receipt["updated_at"] = str(row["updated_at"] or "")
+        receipt["attempt_count"] = int(row["attempt_count"] or 0)
+        if row["error"]:
+            receipt["error_message"] = str(row["error"])
+        failure = details.get("failure")
+        if isinstance(failure, dict):
+            receipt["failure"] = failure
+            if failure.get("code"):
+                receipt["error_code"] = str(failure["code"])
+            if failure.get("user_message"):
+                receipt["user_message"] = str(failure["user_message"])
+        if details.get("error_code") and "error_code" not in receipt:
+            receipt["error_code"] = str(details["error_code"])
+        if receipt["status"] in {"failed", "uncertain"} and "user_message" not in receipt:
+            from .sender import send_failure_message
+
+            receipt["user_message"] = send_failure_message(str(receipt.get("error_code") or "sender_failed"))
+        return receipt
+
     def fail_pending_sends_for_account(self, account_id: str, *, reason: str) -> int:
         """Fail only not-yet-dispatched sends when an account leaves the live registry.
 

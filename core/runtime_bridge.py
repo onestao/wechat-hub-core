@@ -24,6 +24,38 @@ _WINDOW_RE = re.compile(r"0x[0-9a-fA-F]+")
 _PID_RE = re.compile(r"_NET_WM_PID\([^)]*\)\s*=\s*(\d+)")
 
 
+# Runtime keys that are Core-internal: they must never appear in a public API
+# projection or in a persisted runtime snapshot, but an *internally resolved*
+# account still needs them.  ``canonical_runtime_projection`` is the public /
+# persisted shape, so it strips them; ``resolve_runtime_account`` re-attaches
+# them for in-process consumers (sender drivers, controller invocation).
+INTERNAL_RUNTIME_KEYS: tuple[str, ...] = (
+    "controller_command",
+    "key_file",
+    "agent_wechat_token_file",
+    "display_lock",
+    "xauthority",
+)
+
+
+def carry_internal_runtime_fields(
+    projected: dict[str, Any], source: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Re-attach Core-internal runtime fields stripped by the public projection.
+
+    Regression guard for the P0-0 defect where ``AgentWechatSenderDriver``
+    resolved its account through ``resolve_runtime_account`` (which builds the
+    canonical *public* projection) and therefore lost
+    ``agent_wechat_token_file`` -- every AgentWechat send failed with
+    ``agent-wechat token file is unavailable`` before any HTTP call was made.
+    """
+
+    for key in INTERNAL_RUNTIME_KEYS:
+        if key in source:
+            projected[key] = source[key]
+    return projected
+
+
 def _proc_text(proc_root: Path, pid: int, name: str) -> str:
     try:
         data = (proc_root / str(pid) / name).read_bytes()
@@ -261,9 +293,8 @@ def canonical_runtime_projection(
     """
     runtime = dict(account.runtime)
     previous = previous_runtime if isinstance(previous_runtime, dict) else {}
-    runtime.pop("controller_command", None)
-    runtime.pop("key_file", None)
-    runtime.pop("agent_wechat_token_file", None)
+    for key in INTERNAL_RUNTIME_KEYS:
+        runtime.pop(key, None)
     runtime["registered"] = True
     s = status or {}
 
@@ -493,6 +524,10 @@ def resolve_runtime_account(
             bound_wxid=effective_bound,
             binding_state=binding_state,
         )
+        # The canonical projection is the public/persisted shape and therefore
+        # drops Core-internal keys.  This resolved account is used in-process
+        # (sender driver, controller invocation), so put them back.
+        carry_internal_runtime_fields(runtime, account.runtime)
         if effective_bound:
             runtime["bound_wxid"] = effective_bound
 

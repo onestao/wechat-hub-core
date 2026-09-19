@@ -15,13 +15,14 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .identity import IdentityError
-from .registry import AccountConfig, AccountRegistry
+from .registry import AccountConfig, AccountRegistry, provider_sender_capabilities
 from .runtime_bridge import resolve_runtime_account
-from .store import CoreStore, parse_json
+from .store import CoreStore, parse_json, parse_rfc3339, utc_now
 
 try:  # Linux production path; Windows host tests keep the in-process lock only.
     import fcntl
@@ -112,6 +113,179 @@ def sender_capabilities() -> dict[str, Any]:
     }
 
 
+# Product-facing reason vocabulary.  A send must never surface a raw traceback
+# or an internal exception class to the Console; it surfaces one of these.
+SEND_BLOCK_MESSAGES: dict[str, str] = {
+    "sender_disabled": "该账号的发送功能已关闭。",
+    "driver_not_send_capable": "该账号的运行驱动不支持发送。",
+    "wechat_client_unavailable": "微信客户端当前不可用，请稍后重试。",
+    "wechat_not_logged_in": "微信正在完成登录，请稍候。",
+    "wechat_ready_unknown": "正在确认微信登录状态，请稍候。",
+    "account_unknown": "账号不存在或已移除。",
+}
+
+
+def send_block_message(code: str) -> str:
+    return SEND_BLOCK_MESSAGES.get(str(code or ""), "当前无法发送，请稍后重试。")
+
+
+# Readiness blocks that must reject at enqueue time instead of parking the
+# message in the outbox.  The account advertises a send-capable driver, but the
+# live WeChat client is not usable yet, so queueing would only produce an
+# indefinitely "queued" message from the user's point of view.
+ENQUEUE_BLOCK_CODES: frozenset[str] = frozenset(
+    {"wechat_client_unavailable", "wechat_not_logged_in", "wechat_ready_unknown"}
+)
+
+
+def is_enqueue_block(code: str) -> bool:
+    return str(code or "") in ENQUEUE_BLOCK_CODES
+
+
+# Product-facing vocabulary for a *dispatch* failure (as opposed to an enqueue
+# rejection).  The Console renders ``user_message``; the raw internal message is
+# retained on the receipt for operators.
+SEND_FAILURE_MESSAGES: dict[str, str] = {
+    "wechat_not_ready": "微信正在完成登录，请稍候。",
+    "wechat_unavailable": "微信客户端当前不可用，请稍后重试。",
+    "sender_unavailable": "发送服务暂不可用，请稍后重试。",
+    "send_timeout": "发送超时，请稍后重试。",
+    "target_unavailable": "目标会话已不可用，请刷新后重试。",
+    "operator_gui_busy": "微信界面正在被手动操作，请稍后重试。",
+    "sender_failed": "发送失败，请稍后重试。",
+}
+
+
+def send_failure_message(code: str) -> str:
+    return SEND_FAILURE_MESSAGES.get(str(code or ""), SEND_FAILURE_MESSAGES["sender_failed"])
+
+
+def classify_send_failure(exc: BaseException) -> str:
+    """Map an internal dispatch failure to a stable, product-level code.
+
+    Never leaks the exception class or a traceback to the Console; the raw text
+    stays on the receipt for operators.
+    """
+
+    explicit = str(getattr(exc, "code", "") or "")
+    if explicit in SEND_FAILURE_MESSAGES:
+        return explicit
+
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if isinstance(exc, TimeoutError) or "timed out" in text or "timeout" in text:
+        return "send_timeout"
+    if "token file" in text or "base url is missing" in text or "sending service" in text:
+        return "sender_unavailable"
+    if "no longer present" in text or "no longer in normalized" in text or "target chat" in text:
+        return "target_unavailable"
+    if "not logged in" in text or "not ready" in text or "logged_out" in text:
+        return "wechat_not_ready"
+    if (
+        "http 5" in text
+        or "http 4" in text
+        or "connection refused" in text
+        or "connection reset" in text
+        or "name or service not known" in text
+        or "temporary failure in name resolution" in text
+        or "unreachable" in text
+    ):
+        return "wechat_unavailable"
+    return "sender_failed"
+
+
+def account_send_readiness(account: AccountConfig) -> dict[str, Any]:
+    """Authoritative, product-level send readiness for one account.
+
+    Readiness is derived from the *same* authoritative runtime observation that
+    drives the account state machine (``wechat_login_status`` / ``running`` /
+    ``agent_server_healthy``), never from a cached "logged in once" flag and
+    never from the account's own ``sender_capabilities`` claim.  A console that
+    queues a message for an account which is not ready would otherwise hold it
+    in ``queued`` indefinitely.
+    """
+
+    provider = account.runtime_provider
+    capabilities = provider_sender_capabilities(provider)
+    row: dict[str, Any] = {
+        "account_id": account.account_id,
+        "runtime_provider": provider,
+        "sender_enabled": bool(account.sender_enabled),
+        "send_ready": False,
+        "send_blocked_reason": "",
+        "send_blocked_message": "",
+        "capabilities": capabilities,
+    }
+
+    def block(code: str) -> dict[str, Any]:
+        row["send_blocked_reason"] = code
+        row["send_blocked_message"] = send_block_message(code)
+        return row
+
+    if not account.sender_enabled or not bool(account.runtime.get("enabled", True)):
+        return block("sender_disabled")
+    if not any(bool(value) for value in capabilities.values() if isinstance(value, bool)):
+        return block("driver_not_send_capable")
+    if provider != "agent_wechat":
+        return block("driver_not_send_capable")
+
+    running = bool(account.runtime.get("running", False))
+    container_running = bool(account.runtime.get("container_running", running))
+    if not running or not container_running:
+        return block("wechat_client_unavailable")
+    if account.runtime.get("agent_server_healthy") is False:
+        return block("wechat_client_unavailable")
+    login_status = str(account.runtime.get("wechat_login_status") or "").strip()
+    if login_status == "logged_out":
+        return block("wechat_not_logged_in")
+    if login_status != "logged_in":
+        # ``unknown`` / empty telemetry is not proof of readiness.  Report it as
+        # "still settling" rather than "not logged in" so the UI can say
+        # "微信正在完成登录，请稍候" without lying about a logout.
+        return block("wechat_ready_unknown")
+
+    row["send_ready"] = True
+    return row
+
+
+def effective_sender_capabilities(accounts: Iterable[AccountConfig]) -> dict[str, Any]:
+    """Aggregate the *effective* send capability of the live account set.
+
+    The top level answers "what can this deployment send right now", i.e. the
+    union over accounts that are actually ready to send.  The per-driver
+    breakdown stays under ``drivers`` for compatibility.
+
+    Regression guard (P0-0B): a deployment whose only account is an online,
+    logged-in, sender-enabled AgentWechat account must report ``text: true``.
+    It must never be downgraded to ``false`` merely because the legacy/default
+    driver is unused or because no legacy account exists.
+    """
+
+    rows = [account_send_readiness(account) for account in accounts]
+    aggregate: dict[str, Any] = {**LEGACY_SEND_CAPABILITIES}
+    contributing: list[str] = []
+    for row in rows:
+        if not row["send_ready"]:
+            continue
+        contributing.append(row["account_id"])
+        for key, value in row["capabilities"].items():
+            if isinstance(value, bool):
+                aggregate[key] = bool(aggregate.get(key)) or value
+            elif isinstance(value, int):
+                aggregate[key] = max(int(aggregate.get(key) or 0), value)
+    return {
+        **aggregate,
+        "drivers": {
+            "legacy": dict(LEGACY_SEND_CAPABILITIES),
+            "agent_wechat": dict(AGENT_WECHAT_SEND_CAPABILITIES),
+            "native": detect_native_sender_capabilities(),
+        },
+        "effective_from_accounts": sorted(contributing),
+        "accounts_total": len(rows),
+        "accounts_send_ready": len(contributing),
+        "account_readiness": rows,
+    }
+
+
 SEND_CAPABILITIES: dict[str, Any] = sender_capabilities()
 
 
@@ -125,6 +299,18 @@ class DeliveryUncertainError(RuntimeError):
         self.details = dict(details or {})
         self.details.setdefault("delivery_certainty", "unknown")
         self.details.setdefault("automatic_retry", False)
+
+
+class SenderError(RuntimeError):
+    """A send failed deterministically, with an explicit product-level code.
+
+    Raising with an explicit ``code`` keeps the product-facing reason stable
+    instead of relying on substring matching against an internal message.
+    """
+
+    def __init__(self, message: str, *, code: str = "sender_failed") -> None:
+        super().__init__(message)
+        self.code = str(code or "sender_failed")
 
 
 def display_lock(display: str) -> threading.RLock:
@@ -303,7 +489,10 @@ class AgentWechatSenderDriver:
 
         base_url = str(account.runtime.get("agent_wechat_base_url") or "").rstrip("/")
         if not base_url:
-            raise RuntimeError(f"agent-wechat base URL is missing for {account.account_id}")
+            raise SenderError(
+                f"agent-wechat base URL is missing for {account.account_id}",
+                code="sender_unavailable",
+            )
         encoded_chat = urllib.parse.quote(str(chat_id), safe="")
         req = urllib.request.Request(
             f"{base_url}/api/chats/{encoded_chat}/open?clearUnreads=false",
@@ -316,10 +505,14 @@ class AgentWechatSenderDriver:
                 raw = response.read(256 * 1024 + 1)
         except urllib.error.HTTPError as exc:
             detail = exc.read(64 * 1024).decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"agent-wechat chat pre-open returned HTTP {exc.code}: {detail}") from exc
+            raise SenderError(
+                f"agent-wechat chat pre-open returned HTTP {exc.code}: {detail}",
+                code="wechat_unavailable",
+            ) from exc
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
-            raise RuntimeError(
-                f"agent-wechat chat pre-open failed before submission: {type(exc).__name__}"
+            raise SenderError(
+                f"agent-wechat chat pre-open failed before submission: {type(exc).__name__}",
+                code="wechat_unavailable",
             ) from exc
         if len(raw) > 256 * 1024:
             raise RuntimeError("agent-wechat chat pre-open response exceeded safety limit")
@@ -595,9 +788,27 @@ class AccountSender:
                 with account_gui_lease(account_id) as gui_available:
                     if not gui_available:
                         # A live browser desktop is manually controlling this
-                        # account. Keep accepted/queued untouched so the next
-                        # outbox cycle can retry after the operator disconnects.
-                        result["deferred"] += 1
+                        # account. Deferral is intentional, but it must be
+                        # bounded: an indefinitely held lease (a leaked desktop
+                        # session) must not pin a message in ``queued`` forever.
+                        if self._defer_window_exceeded(row):
+                            code = "operator_gui_busy"
+                            self.store.transition_send(
+                                row["send_id"],
+                                "failed",
+                                details={
+                                    "failure": {
+                                        "code": code,
+                                        "reason": "operator_gui_lease_held",
+                                        "user_message": send_failure_message(code),
+                                    }
+                                },
+                                error="interactive desktop lease was held past the deferral window",
+                                error_code=code,
+                            )
+                            result["failed"] += 1
+                        else:
+                            result["deferred"] += 1
                         continue
                     result["processed"] += 1
                     driver_name = str(account.runtime.get("sender_driver") or account.runtime_provider or "legacy")
@@ -637,14 +848,38 @@ class AccountSender:
                         )
                         result["uncertain"] += 1
                     except Exception as exc:
+                        code = classify_send_failure(exc)
                         self.store.transition_send(
                             row["send_id"],
                             "failed",
-                            details=transition_details,
+                            details={
+                                **transition_details,
+                                "failure": {
+                                    "code": code,
+                                    "reason": str(exc),
+                                    "user_message": send_failure_message(code),
+                                },
+                            },
                             error=str(exc),
+                            error_code=code,
                         )
                         result["failed"] += 1
         return result
+
+    def _defer_window_exceeded(self, row: Any) -> bool:
+        """True once an accepted/queued row has waited past the deferral window."""
+
+        try:
+            limit = max(30.0, float(os.environ.get("WECHAT_GUI_LEASE_DEFER_MAX_SECONDS", "600")))
+        except ValueError:
+            limit = 600.0
+        try:
+            accepted = parse_rfc3339(str(row["accepted_at"] or ""))
+        except (KeyError, IndexError, TypeError):
+            return False
+        if accepted is None:
+            return False
+        return (datetime.now(timezone.utc) - accepted).total_seconds() > limit
 
     def process_pending(self, *, limit: int = 20) -> dict[str, int]:
         try:
@@ -696,20 +931,76 @@ class AccountSender:
 
 
 class OutboxLoop:
+    """Background outbox dispatcher.
+
+    The loop must never die silently: a raised exception inside
+    ``process_pending`` (store contention, a driver bug, a registry reload race)
+    used to terminate the thread permanently, which left every accepted message
+    queued forever with no observable error anywhere.  Failures are now
+    recorded and the next cycle continues.
+    """
+
     def __init__(self, sender: AccountSender, interval_seconds: float) -> None:
         self.sender = sender
         self.interval_seconds = max(0.5, float(interval_seconds))
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="wechat-core-outbox", daemon=True)
+        self._liveness_guard = threading.Lock()
+        self._started_at = ""
+        self._cycle_count = 0
+        self._last_cycle_at = ""
+        self._last_cycle_result: dict[str, int] = {}
+        self._last_error = ""
+        self._last_error_at = ""
+        self._consecutive_failures = 0
 
     def start(self) -> None:
+        with self._liveness_guard:
+            self._started_at = utc_now()
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=max(2.0, self.interval_seconds + 1.0))
 
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def liveness(self) -> dict[str, Any]:
+        with self._liveness_guard:
+            return {
+                "worker": "wechat-core-outbox",
+                "started_at": self._started_at,
+                "interval_seconds": self.interval_seconds,
+                "alive": self._thread.is_alive(),
+                "cycle_count": self._cycle_count,
+                "last_cycle_at": self._last_cycle_at,
+                "last_cycle_result": dict(self._last_cycle_result),
+                "last_error": self._last_error,
+                "last_error_at": self._last_error_at,
+                "consecutive_failures": self._consecutive_failures,
+            }
+
+    def _record_cycle(self, result: dict[str, int]) -> None:
+        with self._liveness_guard:
+            self._cycle_count += 1
+            self._last_cycle_at = utc_now()
+            self._last_cycle_result = dict(result or {})
+            self._last_error = ""
+            self._consecutive_failures = 0
+
+    def _record_error(self, exc: BaseException) -> None:
+        with self._liveness_guard:
+            self._cycle_count += 1
+            self._last_cycle_at = utc_now()
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self._last_error_at = self._last_cycle_at
+            self._consecutive_failures += 1
+
     def _run(self) -> None:
         while not self._stop.is_set():
-            self.sender.process_pending()
+            try:
+                self._record_cycle(self.sender.process_pending())
+            except Exception as exc:  # noqa: BLE001 - the loop must survive.
+                self._record_error(exc)
             self._stop.wait(self.interval_seconds)

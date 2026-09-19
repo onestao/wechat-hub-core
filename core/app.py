@@ -12,6 +12,7 @@ import os
 import re
 import threading
 import time
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -31,9 +32,15 @@ from .account_worker import (
 )
 from .avatar import AvatarSecurityError, detect_image_mime, fallback_avatar_svg, fetch_remote_avatar
 from .identity import IdentityError
-from .registry import AccountRegistry, RegistryError, legacy_registry, load_registry
+from .registry import AccountConfig, AccountRegistry, RegistryError, legacy_registry, load_registry
 from .runtime_control import RuntimeControlClient, RuntimeControlError
-from .sender import AccountSender, OutboxLoop, sender_capabilities
+from .sender import (
+    AccountSender,
+    OutboxLoop,
+    account_send_readiness,
+    effective_sender_capabilities,
+    is_enqueue_block,
+)
 from .store import CoreStore, StoreError, account_status_event_semantic, parse_rfc3339, stable_event_value, utc_now
 
 
@@ -225,8 +232,48 @@ class CoreService:
                     enriched,
                     sync_interval=self.sync_interval,
                 )
+                readiness = self._account_send_readiness(config)
+                evaluated["send_ready"] = readiness["send_ready"]
+                evaluated["send_blocked_reason"] = readiness["send_blocked_reason"]
+                evaluated["send_blocked_message"] = readiness["send_blocked_message"]
                 output.append(evaluated)
         return sorted(output, key=lambda item: str(item.get("account_id") or ""))
+
+    def _effective_account(self, config: AccountConfig) -> AccountConfig:
+        """Merge the freshest persisted runtime observation onto a registry row.
+
+        Send readiness must follow the authoritative login observation the
+        account state machine already converged on, so the persisted runtime
+        projection (updated by the sync worker and the Runtime status writers)
+        wins over the static registry entry.
+        """
+        stored = self.store.account(config.account_id) or {}
+        runtime = {**config.runtime, **dict(stored.get("runtime") or {})}
+        return replace(config, runtime=runtime)
+
+    def _account_send_readiness(self, config: AccountConfig) -> dict[str, Any]:
+        try:
+            return account_send_readiness(self._effective_account(config))
+        except Exception:  # pragma: no cover - readiness must never 5xx a read path.
+            return account_send_readiness(config)
+
+    def send_readiness(self, account_id: str) -> dict[str, Any]:
+        config = self.registry.get(account_id)
+        if config is None:
+            return {
+                "account_id": account_id,
+                "send_ready": False,
+                "send_blocked_reason": "account_unknown",
+                "send_blocked_message": "账号不存在或已移除。",
+                "runtime_provider": "",
+                "capabilities": {},
+            }
+        return self._account_send_readiness(config)
+
+    def effective_sender_capabilities(self) -> dict[str, Any]:
+        return effective_sender_capabilities(
+            [self._effective_account(config) for config in self.registry.all()]
+        )
 
     def identity_enriched_account(self, account: dict[str, Any]) -> dict[str, Any]:
         """Extend a stored account row with the identity v2 status shape (B7)."""
@@ -740,6 +787,111 @@ class CoreService:
             raise ApiError(502, "invalid_runtime_response", "Runtime login snapshot exceeds the safe response limit")
         return content, str(result.get("content_type") or "image/png")
 
+    def consumers_status(self) -> dict[str, Any]:
+        """Consumer Control snapshot (Disabled / EFB / Agent).
+
+        Core is an authenticated management API in front of the Runtime control
+        plane; the Console never touches the Docker socket itself.
+        """
+
+        output = self._runtime_request("consumers")
+        payload = output.get("consumers")
+        return dict(payload) if isinstance(payload, dict) else {}
+
+    def set_consumer_mode(self, mode: str) -> dict[str, Any]:
+        mode = str(mode or "").strip().lower()
+        if mode not in {"disabled", "efb", "agent"}:
+            raise ApiError(
+                400, "invalid_request", "mode must be disabled, efb or agent", {"field": "mode"}
+            )
+        output = self._runtime_request("consumers_mode", mode=mode)
+        payload = output.get("consumers")
+        return dict(payload) if isinstance(payload, dict) else {}
+
+    def consumer_action(self, consumer: str, operation: str) -> dict[str, Any]:
+        consumer = str(consumer or "").strip().lower()
+        operation = str(operation or "").strip().lower()
+        if consumer not in {"efb", "agent"}:
+            raise ApiError(404, "not_found", f"Unknown consumer: {consumer}")
+        if operation not in {"start", "stop"}:
+            raise ApiError(404, "not_found", f"Unknown consumer operation: {operation}")
+        output = self._runtime_request("consumer_action", consumer=consumer, operation=operation)
+        payload = output.get("consumers")
+        return dict(payload) if isinstance(payload, dict) else {}
+
+    def install_status(self) -> dict[str, Any]:
+        """Factory Fresh first-install status page payload.
+
+        Reports product-level readiness, never internal engineering state, so a
+        brand new deployment reads as "Core Ready / Runtime Ready / WeChat Not
+        configured / EFB Not configured / Agent Disabled".
+        """
+
+        accounts = self.registry.all()
+        account_states: list[str] = []
+        for config in accounts:
+            row = self.store.account(config.account_id) or {}
+            account_states.append(str(row.get("state") or "offline"))
+        if not accounts:
+            wechat_state = "not_configured"
+        elif any(state == "online" for state in account_states):
+            wechat_state = "ready"
+        elif any(state in {"degraded", "error"} for state in account_states):
+            wechat_state = "attention"
+        else:
+            wechat_state = "starting"
+
+        consumers: dict[str, Any] = {}
+        snapshot: dict[str, Any] = {}
+        runtime_ready = False
+        runtime_error = ""
+        try:
+            snapshot = self.consumers_status()
+            raw = snapshot.get("consumers")
+            if isinstance(raw, dict):
+                consumers = raw
+            runtime_ready = bool((snapshot.get("runtime") or {}).get("available"))
+        except ApiError as exc:
+            runtime_error = str(exc)
+
+        def _consumer_summary(consumer: str) -> dict[str, Any]:
+            entry = consumers.get(consumer) if isinstance(consumers.get(consumer), dict) else {}
+            state = str(entry.get("state") or "unknown")
+            if not entry:
+                label = "unknown"
+            elif state == "running":
+                label = "running"
+            elif not entry.get("configured"):
+                label = "not_configured"
+            elif not entry.get("provisioned"):
+                label = "stopped"
+            else:
+                label = state
+            return {
+                "consumer": consumer,
+                "display_name": str(entry.get("display_name") or consumer),
+                "state": label,
+                "configured": bool(entry.get("configured")),
+                "running": bool(entry.get("running")),
+                "can_start": bool(entry.get("can_start")),
+                "blocked_reason": str(entry.get("blocked_reason") or ""),
+                "last_error": str(entry.get("last_error") or ""),
+            }
+
+        return {
+            "core": {"state": "ready", "accounts": len(accounts)},
+            "runtime": {
+                "state": "ready" if runtime_ready else ("attention" if runtime_error else "unknown"),
+                "error": runtime_error,
+            },
+            "wechat": {"state": wechat_state, "accounts": len(accounts)},
+            "efb": _consumer_summary("efb"),
+            "agent": _consumer_summary("agent"),
+            "consumer_mode": str(snapshot.get("mode") or "disabled") if consumers else "disabled",
+            "desired_mode": str(snapshot.get("desired_mode") or "disabled") if consumers else "disabled",
+            "mutual_exclusion": True,
+        }
+
     def resolve_avatar(
         self,
         avatar_key: str,
@@ -989,10 +1141,11 @@ class CoreHandler(BaseHTTPRequestHandler):
                         "contract_version": CONTRACT_VERSION,
                         "time": utc_now(),
                         "accounts": len(self.service.accounts()),
-                        "sender_capabilities": sender_capabilities(),
+                        "sender_capabilities": self.service.effective_sender_capabilities(),
                         "registry": self.service.registry_status(),
                         "runtime_management": self.service.runtime_management_status(),
                         **self.service.sync_worker_liveness_snapshot(),
+                        **self.service.outbox_worker_liveness_snapshot(),
                         "sync": self.service.sync_health(),
                     },
                 )
@@ -1084,6 +1237,12 @@ class CoreHandler(BaseHTTPRequestHandler):
                 if len(parts) < 2 or not parts[0]:
                     raise ApiError(404, "not_found", f"Unknown endpoint: {path}")
                 self._identity_query(unquote(parts[0]), "/".join(parts[1:]), query)
+                return
+            if path.startswith("/v1/sends/"):
+                send_id = unquote(path[len("/v1/sends/"):]).strip("/")
+                if not send_id or "/" in send_id:
+                    raise ApiError(404, "not_found", f"Unknown endpoint: {path}")
+                self._json(200, self.service.send_status(send_id))
                 return
             if path == "/v1/events/poll":
                 account_id = query.get("account_id", [""])[0].strip()
@@ -1341,6 +1500,23 @@ class CoreHandler(BaseHTTPRequestHandler):
                 # Send Gate (B6): reject identity conflicts with HTTP 409 before
                 # any media upload or queue side effect.
                 self.service.identity_send_gate(account_id, payload)
+                # Send Gate (P0-0): an account that advertises a send-capable
+                # driver but whose WeChat client is not actually usable yet must
+                # not silently park the message in the outbox.  Fail closed with
+                # a human-readable reason so the Console can explain it.
+                readiness = self.service.send_readiness(account_id)
+                if is_enqueue_block(str(readiness.get("send_blocked_reason") or "")):
+                    raise ApiError(
+                        409,
+                        "wechat_not_ready",
+                        str(readiness.get("send_blocked_message") or "微信正在完成登录，请稍候。"),
+                        {
+                            "account_id": account_id,
+                            "reason": str(readiness.get("send_blocked_reason") or ""),
+                            "user_message": str(readiness.get("send_blocked_message") or ""),
+                            "retryable": True,
+                        },
+                    )
                 if len(idempotency_key) > 200:
                     raise ApiError(400, "invalid_request", "Idempotency-Key must be at most 200 characters", {"field": "Idempotency-Key"})
                 request_digest = self.service.store.send_request_digest(kind, payload)
@@ -1482,6 +1658,7 @@ def main(argv: list[str] | None = None) -> int:
         service.sync_worker_liveness = sync_loop.liveness
     if args.send_interval > 0:
         sender_loop = OutboxLoop(AccountSender(registry, service.store, root=workspace_root), args.send_interval)
+        service.outbox_loop = sender_loop
         sender_loop.start()
     server = create_server(args.host, args.port, service)
     print(f"WeChat Core V{CONTRACT_VERSION} listening on http://{args.host}:{server.server_port} ({len(registry.all())} accounts)", flush=True)
