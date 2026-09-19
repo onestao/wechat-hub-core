@@ -536,6 +536,37 @@ class CoreService:
                     )
                 except IdentityError:
                     pass
+                self._hydrate_self_identity(status, observed_user)
+
+    def _hydrate_self_identity(self, status: dict[str, Any], observed_user: str) -> None:
+        """Hydrate the identity's presentation fields from the Runtime profile.
+
+        P0-3: the runtime account registry carries the AgentWechat self record
+        (nickname / wechat_id / avatar).  Until it reaches the identity row, the
+        Console can only show the internal wxid, so this closes the
+        AgentWechat -> Runtime -> Core -> Console chain.  Hydration is
+        presentation-only and never rewrites the wxid evidence.
+        """
+
+        profile = status.get("wechat_profile")
+        if not isinstance(profile, dict):
+            return
+        nickname = str(profile.get("nickname") or "").strip()
+        wechat_id = str(profile.get("wechat_id") or "").strip()
+        avatar_ref = str(profile.get("avatar_url") or profile.get("avatar_ref") or "").strip()
+        source = str(profile.get("identity_source") or "").strip()
+        if nickname == observed_user:
+            nickname = ""
+        try:
+            self.store.hydrate_identity_profile(
+                observed_user,
+                nickname=nickname,
+                wechat_id=wechat_id,
+                avatar_ref=avatar_ref,
+                source=source,
+            )
+        except (IdentityError, sqlite3.Error):
+            pass
 
     def create_runtime_account(self, payload: dict[str, Any]) -> dict[str, Any]:
         provider = str(payload.get("runtime_provider") or payload.get("provider") or "legacy").strip().lower()
@@ -607,14 +638,18 @@ class CoreService:
         login_flow_state = str(login.get("login_flow_state") or "idle")
         login_flow_status = str(login.get("login_flow_status") or "")
         login_flow_error = str(login.get("login_flow_error") or "")
+        login_state = str(login.get("login_state") or "")
         agent_server_healthy = login.get("agent_server_healthy")
         core_state = str(account.get("state") or "offline")
-        if agent_server_healthy is False:
+        # Authoritative observation outranks a stale login-flow terminal state:
+        # an account that is really logged in must never be reported as
+        # "attention" just because a login socket timed out (P0-2).
+        if auth_status == "logged_in" or core_state == "online":
+            state = "online"
+        elif agent_server_healthy is False:
             state = "attention"
         elif login_flow_state in {"error", "timeout"}:
             state = "attention"
-        elif auth_status == "logged_in" or core_state == "online":
-            state = "online"
         elif not running:
             state = "stopped"
         elif not snapshot_available:
@@ -623,6 +658,22 @@ class CoreService:
             state = "attention"
         else:
             state = "waiting"
+        if not login_state:
+            login_state = (
+                "WECHAT_LOGGED_IN"
+                if auth_status == "logged_in"
+                else "FAILED"
+                if login_flow_state in {"error", "timeout"}
+                else "PHONE_CONFIRM_PENDING"
+                if login_flow_state == "phone_confirm"
+                else "QR_READY"
+                if login_flow_state == "waiting_for_scan"
+                else "CREATING"
+            )
+        try:
+            profile = dict(self.store.identity_view(account_id).get("wechat_profile") or {})
+        except (StoreError, sqlite3.Error):
+            profile = {}
         return {
             "account_id": account_id,
             "display_name": str(login.get("display_name") or account.get("display_name") or account_id),
@@ -640,19 +691,24 @@ class CoreService:
             "login_flow_state": login_flow_state,
             "login_flow_status": login_flow_status,
             "login_flow_error": login_flow_error,
+            "login_state": login_state,
+            "login_flow_source": str(login.get("login_flow_source") or "websocket"),
+            "wechat_profile": profile,
         }
 
     def runtime_login_start(self, account_id: str) -> dict[str, Any]:
         self.require_account(account_id)
         result = self._runtime_request("start_login", account_id=account_id)
         login = result.get("login") if isinstance(result.get("login"), dict) else {}
+        login_flow_state = str(login.get("login_flow_state") or "starting")
         return {
             "account_id": account_id,
             "running": bool(login.get("running")),
             "snapshot_available": bool(login.get("snapshot_available")),
-            "login_flow_state": str(login.get("login_flow_state") or "starting"),
+            "login_flow_state": login_flow_state,
             "login_flow_status": str(login.get("login_flow_status") or ""),
             "login_flow_error": str(login.get("login_flow_error") or ""),
+            "login_state": str(login.get("login_state") or ""),
         }
 
     def runtime_login_snapshot(self, account_id: str) -> tuple[bytes, str]:
@@ -707,7 +763,7 @@ class CoreService:
                     return cached
 
         # 3. Check head_image.db across registered accounts
-        for account in list(self.registry.accounts.values()):
+        for account in self.registry.all():
             head_img_db = account.decrypted_dir / "head_image" / "head_image.db"
             if head_img_db.exists():
                 try:

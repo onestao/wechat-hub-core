@@ -966,6 +966,26 @@ class CoreStore:
         with self.connection() as conn:
             return identity.identity_view(conn, account_id)
 
+    def hydrate_identity_profile(
+        self,
+        wechat_user_id: str,
+        *,
+        nickname: str = "",
+        wechat_id: str = "",
+        avatar_ref: str = "",
+        source: str = "",
+    ) -> dict[str, Any] | None:
+        """Hydrate presentation-only fields of a verified identity (P0-3)."""
+        with self.connection() as conn:
+            return identity.hydrate_identity_profile(
+                conn,
+                wechat_user_id,
+                nickname=nickname,
+                wechat_id=wechat_id,
+                avatar_ref=avatar_ref,
+                source=source,
+            )
+
     def wechat_identity(self, wechat_identity_uuid: str) -> dict[str, Any] | None:
         with self.connection() as conn:
             return identity.identity_by_uuid(conn, wechat_identity_uuid)

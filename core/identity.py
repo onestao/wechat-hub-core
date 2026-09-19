@@ -20,6 +20,7 @@ All functions operate on an open ``sqlite3.Connection`` (``row_factory`` may be
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import uuid
@@ -817,6 +818,152 @@ def send_gate(
 # ---------------------------------------------------------------------------
 # account/status view (B7)
 
+# How long the UI may show "reading WeChat profile" before an identity that
+# only ever yielded a wxid must be presented as an internal account id.
+PROFILE_HYDRATION_WINDOW_SEC = 90.0
+
+DISPLAY_SOURCE_NICKNAME = "nickname"
+DISPLAY_SOURCE_ALIAS = "alias"
+DISPLAY_SOURCE_WECHAT_ID = "wechat_id"
+DISPLAY_SOURCE_INTERNAL_ID = "internal_account_id"
+DISPLAY_SOURCE_UNRESOLVED = "unresolved"
+
+HYDRATION_COMPLETE = "complete"
+HYDRATION_PENDING = "pending"
+HYDRATION_UNAVAILABLE = "unavailable"
+
+
+def _profile_json(identity: dict[str, Any] | None) -> dict[str, Any]:
+    value = parse_json_safe((identity or {}).get("profile_json"))
+    return value if isinstance(value, dict) else {}
+
+
+def _hydration_age(profile: dict[str, Any]) -> float | None:
+    started = str(profile.get("hydration_started_at") or "").strip()
+    if not started:
+        return None
+    try:
+        parsed = datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - parsed).total_seconds()
+
+
+def resolve_display_identity(identity: dict[str, Any] | None, *, alias: str = "") -> dict[str, Any]:
+    """Priority-resolved presentation identity for Console.
+
+    Resolution order: ``nickname`` -> configured ``alias`` -> ``wechat_id`` ->
+    ``wxid``.  A nickname that is literally the wxid is *not* a nickname: it is
+    the internal account id echoed back, so it is dropped here and reported
+    through ``display_name_source = internal_account_id`` instead of being
+    dressed up as a display name.
+    """
+
+    identity = identity or {}
+    profile = _profile_json(identity)
+    wxid = str(identity.get("wechat_user_id") or "").strip()
+    nickname = str(identity.get("nickname") or "").strip()
+    if nickname and nickname == wxid:
+        nickname = ""
+    wechat_id = str(profile.get("wechat_id") or "").strip()
+    alias = str(alias or "").strip()
+    avatar_ref = str(identity.get("avatar_ref") or "").strip()
+
+    if nickname:
+        display_name, display_source = nickname, DISPLAY_SOURCE_NICKNAME
+    elif alias:
+        display_name, display_source = alias, DISPLAY_SOURCE_ALIAS
+    elif wechat_id:
+        display_name, display_source = wechat_id, DISPLAY_SOURCE_WECHAT_ID
+    elif wxid:
+        display_name, display_source = wxid, DISPLAY_SOURCE_INTERNAL_ID
+    else:
+        display_name, display_source = "", DISPLAY_SOURCE_UNRESOLVED
+
+    if nickname:
+        hydration = HYDRATION_COMPLETE
+    elif wxid:
+        age = _hydration_age(profile)
+        hydration = (
+            HYDRATION_PENDING
+            if age is not None and age < PROFILE_HYDRATION_WINDOW_SEC
+            else HYDRATION_UNAVAILABLE
+        )
+    else:
+        hydration = HYDRATION_UNAVAILABLE
+
+    return {
+        "wechat_user_id": wxid,
+        "nickname": nickname,
+        "wechat_id": wechat_id,
+        "alias": alias,
+        "avatar_url": avatar_ref if avatar_ref.startswith(("/", "http://", "https://")) else "",
+        "display_name": display_name,
+        "display_name_source": display_source,
+        "identity_source": str(profile.get("identity_source") or ""),
+        "identity_updated_at": str(profile.get("identity_updated_at") or ""),
+        "profile_hydration": hydration,
+    }
+
+
+def hydrate_identity_profile(
+    conn: sqlite3.Connection,
+    wechat_user_id: str,
+    *,
+    nickname: str = "",
+    wechat_id: str = "",
+    avatar_ref: str = "",
+    source: str = "",
+) -> dict[str, Any] | None:
+    """Hydrate the *presentation* fields of a verified identity.
+
+    ``wechat_user_id`` is evidence and is never rewritten here; only the
+    mutable presentation fields (nickname / wechat_id / avatar_ref) and the
+    hydration bookkeeping in ``profile_json`` are touched.  A nickname equal to
+    the wxid is refused: the internal account id must never be stored as a
+    display name.
+    """
+
+    wxid = str(wechat_user_id or "").strip()
+    if not wxid:
+        return None
+    identity = identity_by_wxid(conn, wxid)
+    if identity is None:
+        return None
+    profile = _profile_json(identity)
+    now = utc_now()
+    profile.setdefault("hydration_started_at", now)
+    updates: list[str] = []
+    args: list[Any] = []
+
+    nickname = str(nickname or "").strip()
+    if nickname and nickname != wxid and str(identity.get("nickname") or "") != nickname:
+        updates.append("nickname=?")
+        args.append(nickname)
+    wechat_id = str(wechat_id or "").strip()
+    if wechat_id and str(profile.get("wechat_id") or "") != wechat_id:
+        profile["wechat_id"] = wechat_id
+    avatar_ref = str(avatar_ref or "").strip()
+    if avatar_ref and avatar_ref.startswith(("http://", "https://", "/")) and str(identity.get("avatar_ref") or "") != avatar_ref:
+        updates.append("avatar_ref=?")
+        args.append(avatar_ref)
+
+    if source:
+        profile["identity_source"] = source
+    if updates:
+        profile["identity_updated_at"] = now
+    profile_json = json.dumps(profile, ensure_ascii=False, separators=(",", ":"))
+    updates.append("profile_json=?")
+    args.append(profile_json)
+    updates.append("updated_at=?")
+    args.append(now)
+    args.append(str(identity["wechat_identity_uuid"]))
+    conn.execute(
+        f"UPDATE wechat_identities SET {', '.join(updates)} WHERE wechat_identity_uuid=?",
+        tuple(args),
+    )
+    return identity_by_wxid(conn, wxid)
+
 
 def identity_view(conn: sqlite3.Connection, account_id: str) -> dict[str, Any]:
     """Read-only identity projection for account/status API shapes."""
@@ -829,7 +976,7 @@ def identity_view(conn: sqlite3.Connection, account_id: str) -> dict[str, Any]:
         "identity_binding_state": STATE_UNBOUND,
         "wechat_identity_uuid": "",
         "observed_wechat_user_id": "",
-        "wechat_profile": {"wechat_user_id": "", "nickname": "", "avatar_url": ""},
+        "wechat_profile": resolve_display_identity(None, alias=account_id),
     }
     instance = instance_by_alias(conn, account_id)
     if instance is None and INSTANCE_UUID_RE.match(account_id):
@@ -838,7 +985,6 @@ def identity_view(conn: sqlite3.Connection, account_id: str) -> dict[str, Any]:
         return view
     info = binding_state(conn, instance["instance_uuid"], instance["runtime_alias"])
     identity = info["identity"]
-    avatar_ref = str((identity or {}).get("avatar_ref") or "")
     view.update(
         {
             "instance_uuid": instance["instance_uuid"],
@@ -850,11 +996,10 @@ def identity_view(conn: sqlite3.Connection, account_id: str) -> dict[str, Any]:
             "observed_wechat_user_id": str(
                 (info.get("observation") or {}).get("observed_wechat_user_id") or ""
             ),
-            "wechat_profile": {
-                "wechat_user_id": str((identity or {}).get("wechat_user_id") or ""),
-                "nickname": str((identity or {}).get("nickname") or ""),
-                "avatar_url": avatar_ref if avatar_ref.startswith(("/", "http://", "https://")) else "",
-            },
+            "wechat_profile": resolve_display_identity(
+                identity,
+                alias=str(instance.get("display_name") or instance["runtime_alias"]),
+            ),
         }
     )
     return view
