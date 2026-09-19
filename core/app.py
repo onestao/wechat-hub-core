@@ -505,6 +505,12 @@ class CoreService:
                 "runtime": runtime,
                 "sync": (existing or {}).get("sync") or {},
             }
+            observed_user = str(status.get("logged_in_user") or "").strip()
+            # Self-identity hydration is idempotent and must run even while the
+            # account projection is otherwise unchanged, otherwise the very
+            # first steady-state poll would freeze the identity on the wxid.
+            if observed_user and identity_v2.valid_wxid(observed_user):
+                self._hydrate_self_identity(status, observed_user)
             if existing is not None and account_status_event_semantic(existing) == account_status_event_semantic(projected):
                 # Steady-state GET /health and GET /v1/accounts polling must not
                 # become a DB writer: every poll previously rewrote the identical
@@ -519,7 +525,6 @@ class CoreService:
                 runtime=runtime,
                 sync=projected["sync"],
             )
-            observed_user = str(status.get("logged_in_user") or "").strip()
             if observed_user and identity_v2.valid_wxid(observed_user):
                 # Runtime-verified login observation feeds the binding state
                 # machine (first bind / same identity / mismatch) before any sync
@@ -536,7 +541,6 @@ class CoreService:
                     )
                 except IdentityError:
                     pass
-                self._hydrate_self_identity(status, observed_user)
 
     def _hydrate_self_identity(self, status: dict[str, Any], observed_user: str) -> None:
         """Hydrate the identity's presentation fields from the Runtime profile.
