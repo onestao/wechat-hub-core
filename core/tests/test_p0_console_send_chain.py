@@ -34,8 +34,11 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 
@@ -45,6 +48,7 @@ sys.path.insert(0, str(CORE_ROOT))
 _TEST_GUI_LEASE_DIR = tempfile.TemporaryDirectory()
 os.environ.setdefault("WECHAT_GUI_LEASE_DIR", _TEST_GUI_LEASE_DIR.name)
 
+from core.app import CoreService, create_server  # noqa: E402
 from core.registry import (  # noqa: E402
     AccountConfig,
     AccountRegistry,
@@ -553,6 +557,146 @@ class AgentWechatTokenSurvivesResolutionTest(RuntimeShapedFixture):
         self.assertEqual(result["submitted"], 1)
         self.assertTrue(auth)
         self.assertEqual(auth[0], f"Bearer {token.read_text(encoding='utf-8').strip()}")
+
+
+class SendHttpSurfaceTest(RuntimeShapedFixture):
+    """HTTP surface: /health aggregation, readiness, send status, not-ready gate."""
+
+    def _observe_runtime(self, state: str = "online", **overrides) -> None:
+        runtime = {
+            "runtime_provider": "agent_wechat",
+            "sender_driver": "agent_wechat",
+            "sender_enabled": True,
+            "enabled": True,
+            "running": True,
+            "container_running": True,
+            "agent_server_healthy": True,
+            "wechat_login_status": "logged_in",
+            "logged_in_user": BOUND_WXID,
+        }
+        runtime.update(overrides)
+        self.store.upsert_account("arasial", "Arasial", state=state, runtime=runtime)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.token = self.write_token()
+        self.registry = self.write_registry(
+            [
+                _agent_entry(
+                    token_file=f"/config/agent-wechat/{RESOURCE_KEY}/auth-token",
+                    home=f"/config/agent-wechat/{RESOURCE_KEY}/home",
+                )
+            ]
+        )
+        # The service must be built before the first account row is written:
+        # CoreService applies the identity-v2 migration from the registry, and a
+        # pre-existing row without an instance_uuid would bind the alias to a
+        # generated instance and then conflict with the registry's.
+        self.service = CoreService(root=self.temp_root, registry=self.registry, store=self.store)
+        self._observe_runtime()
+        self.store.upsert_chat(
+            {"account_id": "arasial", "chat_id": "chat-target", "type": "group", "display_name": "Target"}
+        )
+        self.server = create_server("127.0.0.1", 0, self.service)
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        super().tearDown()
+
+    def request(self, path: str, method: str = "GET", payload: dict | None = None) -> tuple[int, Any]:
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"Content-Type": "application/json"} if body else {}
+        request = urllib.request.Request(self.base_url + path, data=body, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                raw = response.read().decode("utf-8")
+                return response.status, (json.loads(raw) if raw else {})
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8")
+            return exc.code, (json.loads(raw) if raw else {})
+
+    def test_health_reports_effective_capability_and_send_worker(self) -> None:
+        status, health = self.request("/health")
+        self.assertEqual(status, 200)
+        caps = health["sender_capabilities"]
+        self.assertTrue(caps["text"], caps)
+        self.assertTrue(caps["image"])
+        self.assertEqual(caps["effective_from_accounts"], ["arasial"])
+        self.assertEqual(caps["accounts_send_ready"], 1)
+        # The per-driver catalog stays available for compatibility.
+        self.assertTrue(caps["drivers"]["agent_wechat"]["text"])
+        self.assertIn("send_worker", health)
+
+    def test_accounts_expose_send_readiness(self) -> None:
+        status, payload = self.request("/v1/accounts")
+        self.assertEqual(status, 200)
+        account = payload["accounts"][0]
+        self.assertTrue(account["send_ready"])
+        self.assertEqual(account["send_blocked_reason"], "")
+
+    def test_not_ready_account_is_rejected_at_enqueue(self) -> None:
+        self._observe_runtime(
+            state="login_required",
+            wechat_login_status="unknown",
+            logged_in_user="",
+        )
+        status, payload = self.request(
+            "/v1/send/text",
+            method="POST",
+            payload={"account_id": "arasial", "chat_id": "chat-target", "text": "hi"},
+        )
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["error"]["code"], "wechat_not_ready")
+        self.assertTrue(payload["error"]["message"])
+        self.assertNotIn("Traceback", payload["error"]["message"])
+
+    def test_ready_account_is_accepted_and_send_status_is_queryable(self) -> None:
+        status, receipt = self.request(
+            "/v1/send/text",
+            method="POST",
+            payload={"account_id": "arasial", "chat_id": "chat-target", "text": "hi"},
+        )
+        self.assertEqual(status, 202, receipt)
+        self.assertEqual(receipt["status"], "accepted")
+
+        status, fetched = self.request(f"/v1/sends/{receipt['send_id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["send_id"], receipt["send_id"])
+        self.assertEqual(fetched["status"], "accepted")
+
+        status, missing = self.request("/v1/sends/send-does-not-exist")
+        self.assertEqual(status, 404)
+        self.assertEqual(missing["error"]["code"], "send_not_found")
+
+    def test_send_status_carries_user_facing_failure_reason(self) -> None:
+        _, receipt = self.request(
+            "/v1/send/text",
+            method="POST",
+            payload={"account_id": "arasial", "chat_id": "chat-target", "text": "hi"},
+        )
+        self.store.transition_send(
+            receipt["send_id"],
+            "failed",
+            details={
+                "failure": {
+                    "code": "wechat_unavailable",
+                    "reason": "agent-wechat send returned HTTP 503: upstream down",
+                    "user_message": "微信客户端当前不可用，请稍后重试。",
+                }
+            },
+            error="agent-wechat send returned HTTP 503: upstream down",
+            error_code="wechat_unavailable",
+        )
+        status, fetched = self.request(f"/v1/sends/{receipt['send_id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["status"], "failed")
+        self.assertEqual(fetched["user_message"], "微信客户端当前不可用，请稍后重试。")
+        self.assertNotIn("upstream down", fetched["user_message"])
 
 
 class OutboxLoopLivenessTest(RuntimeShapedFixture):

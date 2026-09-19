@@ -258,6 +258,8 @@ class CoreService:
             return account_send_readiness(config)
 
     def send_readiness(self, account_id: str) -> dict[str, Any]:
+        """Authoritative send readiness for one account (fail-closed)."""
+
         config = self.registry.get(account_id)
         if config is None:
             return {
@@ -269,6 +271,14 @@ class CoreService:
                 "capabilities": {},
             }
         return self._account_send_readiness(config)
+
+    def send_status(self, send_id: str) -> dict[str, Any]:
+        """Authoritative send receipt for one send_id (Console read path)."""
+
+        receipt = self.store.send_status(send_id)
+        if receipt is None:
+            raise ApiError(404, "send_not_found", f"Unknown send_id: {send_id}")
+        return receipt
 
     def effective_sender_capabilities(self) -> dict[str, Any]:
         return effective_sender_capabilities(
@@ -320,6 +330,26 @@ class CoreService:
         if liveness is None:
             return {}
         return {"sync_worker": liveness.snapshot()}
+
+    def outbox_worker_liveness_snapshot(self) -> dict[str, Any]:
+        """Report whether the send worker exists and is cycling.
+
+        A silent sender-loop death used to be invisible: the queue simply never
+        drained.  ``/health`` now always answers "is there a send worker and is
+        it alive".
+        """
+
+        loop = getattr(self, "outbox_loop", None)
+        if loop is None:
+            return {
+                "send_worker": {
+                    "worker": "wechat-core-outbox",
+                    "enabled": False,
+                    "alive": False,
+                    "reason": "send loop disabled (--send-interval 0)",
+                }
+            }
+        return {"send_worker": {"enabled": True, **loop.liveness()}}
 
     def reload_registry(self, *, force: bool = False) -> dict[str, Any]:
         with self._registry_reload_lock:
