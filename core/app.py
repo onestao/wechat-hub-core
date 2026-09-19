@@ -828,6 +828,39 @@ class CoreService:
         payload = output.get("consumers")
         return dict(payload) if isinstance(payload, dict) else {}
 
+    #: Runtime consumer name -> the Core consumer identity that consumer polls as.
+    CONSUMER_CORE_IDS: dict[str, str] = {
+        "agent": "wechat-agent",
+        "efb": "efb-linux-wechat:wechat.linux",
+    }
+
+    def provision_consumer_checkpoint(self, consumer: str) -> dict[str, Any]:
+        """Give a just-started consumer its governed Core checkpoint.
+
+        Core refuses a cold poll at cursor 0 for a registered consumer
+        (``missing_bootstrap_provenance``), so a freshly provisioned consumer
+        would otherwise ingest nothing while looking perfectly healthy.  The
+        Runtime is the lifecycle owner, so provisioning happens here exactly once
+        at start time instead of requiring every consumer image to implement the
+        bootstrap itself.
+        """
+
+        consumer_id = self.CONSUMER_CORE_IDS.get(str(consumer or "").strip().lower(), "")
+        if not consumer_id:
+            return {"provisioned": False, "reason": "unknown_consumer"}
+        try:
+            result = self.store.bootstrap_consumer(consumer_id, mode="at_head")
+        except StoreError as exc:
+            # An existing checkpoint in another mode is authoritative: a mode
+            # switch must never reset a consumer's ingestion position.
+            return {"consumer_id": consumer_id, "provisioned": False, "reason": exc.code}
+        return {
+            "consumer_id": consumer_id,
+            "provisioned": True,
+            "initial_cursor": result.get("initial_cursor"),
+            "idempotent": bool(result.get("idempotent")),
+        }
+
     def set_consumer_mode(self, mode: str) -> dict[str, Any]:
         mode = str(mode or "").strip().lower()
         if mode not in {"disabled", "efb", "agent"}:
@@ -835,8 +868,8 @@ class CoreService:
                 400, "invalid_request", "mode must be disabled, efb or agent", {"field": "mode"}
             )
         output = self._runtime_request("consumers_mode", mode=mode)
-        payload = output.get("consumers")
-        return dict(payload) if isinstance(payload, dict) else {}
+        payload = dict(output.get("consumers")) if isinstance(output.get("consumers"), dict) else {}
+        return self._with_consumer_provisioning(payload, requested=mode)
 
     def consumer_action(self, consumer: str, operation: str) -> dict[str, Any]:
         consumer = str(consumer or "").strip().lower()
@@ -846,8 +879,19 @@ class CoreService:
         if operation not in {"start", "stop"}:
             raise ApiError(404, "not_found", f"Unknown consumer operation: {operation}")
         output = self._runtime_request("consumer_action", consumer=consumer, operation=operation)
-        payload = output.get("consumers")
-        return dict(payload) if isinstance(payload, dict) else {}
+        payload = dict(output.get("consumers")) if isinstance(output.get("consumers"), dict) else {}
+        if operation == "start":
+            return self._with_consumer_provisioning(payload, requested=consumer)
+        return payload
+
+    def _with_consumer_provisioning(self, payload: dict[str, Any], *, requested: str) -> dict[str, Any]:
+        """Attach the Core-side checkpoint provisioning result for a started consumer."""
+
+        consumers = payload.get("consumers") if isinstance(payload.get("consumers"), dict) else {}
+        entry = consumers.get(requested) if isinstance(consumers.get(requested), dict) else {}
+        if entry.get("running"):
+            payload["core_provisioning"] = self.provision_consumer_checkpoint(requested)
+        return payload
 
     def install_status(self) -> dict[str, Any]:
         """Factory Fresh first-install status page payload.
@@ -1301,6 +1345,12 @@ class CoreHandler(BaseHTTPRequestHandler):
                     raise ApiError(404, "checkpoint_not_found", f"No checkpoint found for consumer {consumer_id}")
                 self._json(200, output)
                 return
+            if path == "/v1/consumers":
+                self._json(200, self.service.consumers_status())
+                return
+            if path == "/v1/install/status":
+                self._json(200, self.service.install_status())
+                return
             if path.startswith("/v1/consumers/") and path.endswith("/bootstrap"):
                 raw_consumer_id = path[len("/v1/consumers/"):-len("/bootstrap")].strip("/")
                 consumer_id = unquote(raw_consumer_id)
@@ -1498,6 +1548,15 @@ class CoreHandler(BaseHTTPRequestHandler):
                     raise ApiError(exc.status, exc.code, str(exc), exc.details) from exc
                 self._json(200, output)
                 return
+            if path == "/v1/consumers/mode":
+                self._json(200, self.service.set_consumer_mode(required_text(payload, "mode")))
+                return
+            if path.startswith("/v1/consumers/"):
+                suffix = path[len("/v1/consumers/"):].strip("/")
+                parts = suffix.split("/")
+                if len(parts) == 2 and parts[0] and parts[1]:
+                    self._json(200, self.service.consumer_action(unquote(parts[0]), unquote(parts[1])))
+                    return
             if path == "/v1/runtime/accounts":
                 self._json(201, self.service.create_runtime_account(payload))
                 return
