@@ -1197,22 +1197,14 @@ class AgentWechatSenderRoutingTest(unittest.TestCase):
         self.assertEqual(
             set(calls),
             {
-                (
-                    "http://wechat-agent-alpha:6174/api/chats/chat-alpha/open?clearUnreads=false",
-                    "Bearer token-alpha",
-                    "",
-                    "",
-                ),
                 ("http://wechat-agent-alpha:6174/api/messages/send", "Bearer token-alpha", "chat-alpha", "hello-a"),
-                (
-                    "http://wechat-agent-beta:6174/api/chats/chat-beta/open?clearUnreads=false",
-                    "Bearer token-beta",
-                    "",
-                    "",
-                ),
                 ("http://wechat-agent-beta:6174/api/messages/send", "Bearer token-beta", "chat-beta", "hello-b"),
             },
         )
+        # P0-0: Core must never pre-open the chat itself.  Pre-opening a chat
+        # that is not already active makes the upstream send plan skip its own
+        # verified open and report a false success from an empty composer.
+        self.assertFalse([url for url in calls if "/api/chats/" in url[0]])
 
     def test_manual_desktop_defers_only_that_account_without_attempting_upstream(self):
         alpha = self.store.queue_send(
@@ -1388,7 +1380,9 @@ class AgentWechatSenderRoutingTest(unittest.TestCase):
             second = self.sender.process_pending()
         second_urlopen.assert_not_called()
         self.assertEqual(second["processed"], 0)
-        self.assertEqual(first_urlopen.call_count, 2)
+        # Exactly one upstream call: the send.  Core never pre-opens the chat
+        # (P0-0: a pre-open makes the upstream plan report a false success).
+        self.assertEqual(first_urlopen.call_count, 1)
         with self.store.connection() as conn:
             attempt_count = conn.execute(
                 "SELECT attempt_count FROM outbox WHERE send_id=?", (receipt["send_id"],)
@@ -1463,10 +1457,22 @@ class AgentWechatSenderRoutingTest(unittest.TestCase):
         self.assertEqual(file_payload["file"]["data"], base64.b64encode(file_bytes).decode("ascii"))
         self.assertEqual(file_payload["file"]["filename"], "report.txt")
 
-    def test_agent_chat_preopen_target_mismatch_fails_before_send_endpoint(self):
+    def test_agent_send_never_preopens_the_chat(self):
+        """P0-0 regression: Core must not pre-open the target chat.
+
+        Reproduced on the Factory Fresh deployment: pre-opening a chat that is
+        not already the active one transitions the WeChat UI, after which the
+        upstream send plan reports "target already verified open", skips its own
+        Opening/VerifyingPrimaryOpen phases, and finally declares success from a
+        ``Send button DISABLED`` condition that an *empty* composer also
+        satisfies.  The message is never delivered while the plan still returns
+        ``{"success": true}``.  Letting the plan own the open delivers
+        correctly, so Core must issue exactly one upstream call: the send.
+        """
+
         self.store.queue_send(
             "text",
-            {"account_id": "alpha", "chat_id": "chat-alpha", "text": "must-not-send"},
+            {"account_id": "alpha", "chat_id": "chat-alpha", "text": "must-not-preopen"},
         )
         calls: list[str] = []
 
@@ -1478,7 +1484,7 @@ class AgentWechatSenderRoutingTest(unittest.TestCase):
                 return False
 
             def read(self, _limit=-1):
-                return b'{"ok":true,"username":"wrong-chat"}'
+                return b'{"ok":true,"username":"chat-alpha"}'
 
         def fake_urlopen(request, timeout=0):
             del timeout
@@ -1488,10 +1494,10 @@ class AgentWechatSenderRoutingTest(unittest.TestCase):
         with patch("core.sender.urllib.request.urlopen", side_effect=fake_urlopen):
             result = self.sender.process_pending()
 
-        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["submitted"], 1, result)
         self.assertEqual(
             calls,
-            ["http://wechat-agent-alpha:6174/api/chats/chat-alpha/open?clearUnreads=false"],
+            ["http://wechat-agent-alpha:6174/api/messages/send"],
         )
 
 

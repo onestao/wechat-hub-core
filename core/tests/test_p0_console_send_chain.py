@@ -25,6 +25,7 @@ Covers gates T1-T12 of the P0-0 taskbook.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -368,9 +369,9 @@ class AgentWechatDispatchTest(RuntimeShapedFixture):
 
         self.assertEqual(result["submitted"], 1, result)
         self.assertEqual(result["deferred"], 0, result)
-        # T6: the request reached the AgentWechat dispatch plane with the exact target.
-        self.assertIn("http://wechat-agent-arasial-11d4b2d9:6174/api/chats/chat-target/open?clearUnreads=false", calls)
-        self.assertIn("http://wechat-agent-arasial-11d4b2d9:6174/api/messages/send", calls)
+        # T6: the request reached the AgentWechat dispatch plane with the exact
+        # target, and Core did NOT pre-open the chat (see AgentWechatSenderDriver.send).
+        self.assertEqual(calls, ["http://wechat-agent-arasial-11d4b2d9:6174/api/messages/send"])
 
         # T7: queued left queued.
         status = self.store.send_status(send_id)
@@ -400,8 +401,13 @@ class AgentWechatDispatchTest(RuntimeShapedFixture):
         send_id = self._queue("will-fail")
 
         def failing_urlopen(request, timeout=0):
-            del request, timeout
-            raise OSError("Connection refused")
+            del timeout
+            # A deterministic upstream answer (HTTP 5xx) is a clean failure.
+            # A transport timeout after POSTing would instead be `uncertain`,
+            # because delivery may already have happened.
+            raise urllib.error.HTTPError(
+                request.full_url, 503, "Service Unavailable", {}, io.BytesIO(b"upstream down")
+            )
 
         with patch("core.sender.urllib.request.urlopen", side_effect=failing_urlopen):
             result = self.sender.process_pending()
@@ -412,11 +418,9 @@ class AgentWechatDispatchTest(RuntimeShapedFixture):
         self.assertEqual(status["error_code"], "wechat_unavailable")
         self.assertTrue(status["user_message"])
         # The product-facing reason never leaks the internal exception text.
-        self.assertNotIn("OSError", status["user_message"])
-        self.assertNotIn("Connection refused", status["user_message"])
-        # The operator-facing reason stays on the receipt while the user-facing
-        # message is the product vocabulary.
-        self.assertIn("chat pre-open failed before submission", status["details"]["failure"]["reason"])
+        self.assertNotIn("HTTPError", status["user_message"])
+        self.assertNotIn("upstream down", status["user_message"])
+        self.assertIn("HTTP 503", status["details"]["failure"]["reason"])
 
     def test_failure_classification_is_stable(self):
         self.assertEqual(classify_send_failure(RuntimeError("agent-wechat token file is unavailable for x")), "sender_unavailable")
@@ -697,6 +701,26 @@ class SendHttpSurfaceTest(RuntimeShapedFixture):
         self.assertEqual(fetched["status"], "failed")
         self.assertEqual(fetched["user_message"], "微信客户端当前不可用，请稍后重试。")
         self.assertNotIn("upstream down", fetched["user_message"])
+
+
+    def test_uncertain_send_reports_an_uncertainty_message(self) -> None:
+        _, receipt = self.request(
+            "/v1/send/text",
+            method="POST",
+            payload={"account_id": "arasial", "chat_id": "chat-target", "text": "hi"},
+        )
+        self.store.transition_send(receipt["send_id"], "submitted")
+        with self.store.connection() as conn:
+            conn.execute(
+                "UPDATE outbox SET updated_at='2020-01-01T00:00:00Z' WHERE send_id=?",
+                (receipt["send_id"],),
+            )
+        self.assertEqual(self.store.expire_submitted_sends(max_age_seconds=1), 1)
+        status, fetched = self.request(f"/v1/sends/{receipt['send_id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["status"], "uncertain")
+        self.assertIn("未能确认", fetched["user_message"])
+        self.assertNotIn("请稍后重试", fetched["user_message"])
 
 
 class OutboxLoopLivenessTest(RuntimeShapedFixture):

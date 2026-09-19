@@ -2639,9 +2639,12 @@ class CoreStore:
         if details.get("error_code") and "error_code" not in receipt:
             receipt["error_code"] = str(details["error_code"])
         if receipt["status"] in {"failed", "uncertain"} and "user_message" not in receipt:
-            from .sender import send_failure_message
+            from .sender import UNCERTAIN_DELIVERY_MESSAGE, send_failure_message
 
-            receipt["user_message"] = send_failure_message(str(receipt.get("error_code") or "sender_failed"))
+            if receipt["status"] == "uncertain":
+                receipt["user_message"] = UNCERTAIN_DELIVERY_MESSAGE
+            else:
+                receipt["user_message"] = send_failure_message(str(receipt.get("error_code") or "sender_failed"))
         return receipt
 
     def fail_pending_sends_for_account(self, account_id: str, *, reason: str) -> int:

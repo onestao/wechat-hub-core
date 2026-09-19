@@ -160,6 +160,12 @@ def send_failure_message(code: str) -> str:
     return SEND_FAILURE_MESSAGES.get(str(code or ""), SEND_FAILURE_MESSAGES["sender_failed"])
 
 
+# ``uncertain`` is not a plain failure: upstream reported success but Core never
+# observed a matching outgoing echo, so the message may or may not have been
+# delivered.  Never invite an automatic retry from this state.
+UNCERTAIN_DELIVERY_MESSAGE = "未能确认微信是否已接收，请核对后决定是否重发。"
+
+
 def classify_send_failure(exc: BaseException) -> str:
     """Map an internal dispatch failure to a stable, product-level code.
 
@@ -473,18 +479,12 @@ class AgentWechatSenderDriver:
         return result
 
     def _preopen_chat(self, account: AccountConfig, chat_id: str) -> dict[str, Any]:
-        """Stabilize the target chat before entering upstream's send plan.
+        """Open one chat through the upstream endpoint.
 
-        agent-wechat's send plan can open a previously unopened chat and then
-        immediately advance into focus/input actions.  On a freshly logged-in
-        account that UI transition can race the input action while the upstream
-        plan still reaches its disabled-Send-button success condition.  Opening
-        the chat through the upstream's dedicated endpoint first separates the
-        non-delivery UI transition from the delivery attempt and gives us one
-        more exact-target check before any message can be submitted.
-
-        Failure here is deterministic (no send endpoint has been called yet),
-        so it must fail closed rather than become delivery uncertainty.
+        DO NOT call this on the send path -- see ``send()``.  It is retained as
+        a documented primitive (and for the lifecycle/debug surface), but
+        pre-opening a chat that is not already the active one makes the
+        immediately following send silently no-op upstream.
         """
 
         base_url = str(account.runtime.get("agent_wechat_base_url") or "").rstrip("/")
@@ -540,6 +540,28 @@ class AgentWechatSenderDriver:
             raise RuntimeError("agent-wechat send API does not expose verified mention semantics; request was not sent")
 
     def send(self, kind: str, account_id: str, chat_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """Dispatch one send through upstream agent-wechat.
+
+        The upstream send plan owns the whole verified sequence: open the exact
+        target, positively verify the open chat header, resolve the active
+        composer in the active frame, type, submit, then confirm.
+
+        Core deliberately does **not** pre-open the chat first.  Reproduced on
+        the Factory Fresh deployment (A/B/D probes, 2026-09-19): pre-opening a
+        chat that is not already the active one transitions the UI, the send
+        plan then reports "target already verified open" and skips its own
+        Opening/VerifyingPrimaryOpen phases, and it finally declares success
+        from its ``Send button DISABLED`` condition -- which an *empty*
+        composer also satisfies.  The message is never delivered, yet the plan
+        returns ``{"success": true}``.  Letting the plan perform its own open
+        delivers correctly (verified for both a never-opened chat and a
+        previously-opened one).
+
+        A false upstream success is still caught by Core: without a unique
+        outgoing DB echo inside the confirmation window the send converges to
+        ``uncertain`` instead of ``sent``.
+        """
+
         account = resolve_runtime_account(self.registry.require(account_id))
         if account.runtime.get("agent_server_healthy") is False:
             raise RuntimeError(
@@ -572,11 +594,9 @@ class AgentWechatSenderDriver:
                 payload["file"] = {"data": data, "filename": filename}
         else:
             raise RuntimeError(f"unsupported send kind for agent-wechat: {kind}")
-        preopen = self._preopen_chat(account, str(chat["chat_id"]))
         upstream = self._request(account, payload)
         return {
             "driver": "agent_wechat",
-            "preopen": preopen,
             "upstream": upstream,
             "confirmed": False,
             "note": "agent-wechat FSM accepted the send; Core has not observed a matching DB echo yet.",
