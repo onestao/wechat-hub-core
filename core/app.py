@@ -716,7 +716,7 @@ class CoreService:
     def reproject_account(self, account_id: str) -> dict[str, Any]:
         self.require_account(account_id)
         with self.store.connection() as conn:
-            gate = identity.sync_gate(conn, account_id)
+            gate = identity_v2.sync_gate(conn, account_id)
             instance_uuid = str(gate["instance"]["instance_uuid"])
             identity_uuid = str(gate["stamp_identity"])
             rows = conn.execute("SELECT * FROM messages WHERE account_id=?", (account_id,)).fetchall()
