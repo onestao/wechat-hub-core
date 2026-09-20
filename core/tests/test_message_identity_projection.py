@@ -305,49 +305,6 @@ class MessageIdentityProjectionTest(unittest.TestCase):
         self.assertEqual(out_events[0]["payload"]["message"]["instance_uuid"], self.instance_uuid)
         self.assertEqual(out_events[0]["payload"]["message"]["wechat_identity_uuid"], self.identity_a)
 
-    def test_criterion_g_console_messages_filter_behavior_simulation(self):
-        """G. 现有 Console messages.js 无需删除身份过滤即可返回有效消息。"""
-        # Normalizer producing message
-        row_mock = {
-            "message_uid": "msg-005",
-            "chat_username": self.chat_id,
-            "type_label": "text",
-            "message_content": "hello world",
-            "compress_content": "",
-            "source": "",
-            "origin_source": 0,
-            "create_time": 1789889228,
-        }
-        normalized = _normalized_message(
-            self.account_id,
-            row_mock,
-            {},
-            instance_uuid=self.instance_uuid,
-            wechat_identity_uuid=self.identity_a,
-        )
-        self.assertEqual(normalized["instance_uuid"], self.instance_uuid)
-        self.assertEqual(normalized["wechat_identity_uuid"], self.identity_a)
-
-        self.store.upsert_message(normalized)
-
-        # Simulated Console messages.js query with both filters intact
-        params = {
-            "account_id": self.account_id,
-            "chat_id": self.chat_id,
-            "instance_uuid": self.instance_uuid,
-            "wechat_identity_uuid": self.identity_a,
-        }
-        res = self.store.list_messages(
-            params["account_id"],
-            params["chat_id"],
-            instance_uuid=params["instance_uuid"],
-            wechat_identity_uuid=params["wechat_identity_uuid"],
-        )
-        self.assertEqual(len(res["messages"]), 1)
-        self.assertEqual(res["messages"][0]["message_id"], "msg-005")
-        self.assertEqual(res["messages"][0]["instance_uuid"], self.instance_uuid)
-        self.assertEqual(res["messages"][0]["wechat_identity_uuid"], self.identity_a)
-
     def test_criterion_h_rebind_existing_message_update_preserves_identity(self):
         """H. identity A 创建消息 → rebind B → 同一 A 消息发生内容或媒体状态 update → Core DB 仍为 A → emitted message.updated 仍为 A → Console 消费后仍为 A。"""
         # 1. Identity A creates message

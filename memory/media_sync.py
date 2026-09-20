@@ -574,15 +574,45 @@ def sync_image(row: sqlite3.Row, args, resource_map: dict[tuple[str, int], str],
     selected = choose_dat(dat_files, prefer_thumb=args.prefer_thumbnails)
     if not selected:
         thumbnail_only = bool(dat_files) and all(path.name.endswith("_t.dat") for path in dat_files)
+        if not thumbnail_only:
+            return {
+                "message_uid": row["message_uid"],
+                "chat_username": chat_username,
+                "local_id": local_id,
+                "media_type": "image",
+                "original_md5": media_md5,
+                "status": "missing_file",
+                "error": "local .dat cache not found",
+            }
+        thumbnail = choose_dat(dat_files, prefer_thumb=True)
+        data, fmt = decrypt_dat(thumbnail, cfg.get("image_aes_key"), int(cfg.get("image_xor_key", 0x88)))
+        if not data or not fmt or fmt == "hevc":
+            return {
+                "message_uid": row["message_uid"],
+                "chat_username": chat_username,
+                "local_id": local_id,
+                "media_type": "image",
+                "original_md5": media_md5,
+                "source_path": str(thumbnail),
+                "status": "original_pending",
+                "error": "only thumbnail cache is available but it is not browser-displayable",
+            }
+        target = args.media_dir / "images" / f"{media_md5}_thumb.{fmt}"
+        if not target.exists() or target.stat().st_size != len(data):
+            safe_write(target, data)
+        width, height = image_dimensions(data, fmt)
         return {
             "message_uid": row["message_uid"],
             "chat_username": chat_username,
             "local_id": local_id,
             "media_type": "image",
             "original_md5": media_md5,
-            "source_path": str(dat_files[0]) if thumbnail_only else None,
-            "status": "original_pending" if thumbnail_only else "missing_file",
-            "error": "only thumbnail cache is available" if thumbnail_only else "local .dat cache not found",
+            "source_path": str(thumbnail),
+            "thumb_path": str(target),
+            "mime_type": mimetypes.guess_type(str(target))[0] or "application/octet-stream",
+            "width": width,
+            "height": height,
+            "status": "ready",
         }
     data, fmt = decrypt_dat(selected, cfg.get("image_aes_key"), int(cfg.get("image_xor_key", 0x88)))
     if not data or not fmt:

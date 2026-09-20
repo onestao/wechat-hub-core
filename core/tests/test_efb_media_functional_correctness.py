@@ -50,6 +50,30 @@ class EFBMediaFunctionalCorrectnessTest(unittest.TestCase):
         paths, _ = self._image_paths(["_t"])
         self.assertIsNone(media_sync.choose_dat(paths, prefer_thumb=False))
 
+    def test_f1_2_thumbnail_only_is_publishable_as_thumbnail(self) -> None:
+        paths, media_md5 = self._image_paths(["_t"])
+        row = {
+            "message_uid": "message-1",
+            "chat_username": "chat-1",
+            "local_id": 7,
+        }
+        args = SimpleNamespace(
+            wechat_base_dir=self.root / "wechat",
+            media_dir=self.root / "media",
+            prefer_thumbnails=False,
+        )
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+        with patch.object(media_sync, "decrypt_dat", return_value=(png, "png")):
+            result = media_sync.sync_image(
+                row,
+                args,
+                {("chat-1", 7): media_md5},
+                {},
+            )
+        self.assertEqual(result["status"], "ready")
+        self.assertNotIn("media_path", result)
+        self.assertTrue(str(result["thumb_path"]).endswith("_thumb.png"))
+
     def test_f1_3_original_becomes_selectable_after_it_arrives(self) -> None:
         paths, media_md5 = self._image_paths(["_t"])
         self.assertIsNone(media_sync.choose_dat(paths, prefer_thumb=False))
@@ -108,6 +132,8 @@ class EFBMediaFunctionalCorrectnessTest(unittest.TestCase):
         self.assertEqual(normalized["media_id"], "message-1")
         self.assertEqual(normalized["media_role"], "original")
         self.assertEqual(normalized["media_status"], "original_pending")
+        self.assertEqual(normalized["filename"], "")
+        self.assertEqual(normalized["mime_type"], "")
         self.assertEqual(
             normalized["vendor_specific"]["media"]["original_media_id"],
             "message-1",

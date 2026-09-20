@@ -342,13 +342,20 @@ def _normalized_message(
     if wechat_identity_uuid:
         normalized["wechat_identity_uuid"] = wechat_identity_uuid
     if media:
+        media_id = str(media.get("media_id") or "")
+        media_status = str(media.get("status") or "")
+        media_filename = str(media.get("filename") or "")
+        media_mime_type = str(media.get("mime_type") or "")
+        if media_status != "ready" and media_filename == media_id:
+            media_filename = ""
+            media_mime_type = ""
         normalized.update(
             {
-                "media_id": media["media_id"],
-                "filename": media["filename"],
-                "mime_type": media["mime_type"],
+                "media_id": media_id,
+                "filename": media_filename,
+                "mime_type": media_mime_type,
                 "media_role": media["role"],
-                "media_status": media["status"],
+                "media_status": media_status,
             }
         )
     return normalized
@@ -493,8 +500,12 @@ def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
                     # pending *original* and must never be labelled a thumbnail
                     # (nor may a thumbnail ever be published as an original).
                     role = "original"
+                elif raw_media_path:
+                    role = "original"
+                elif raw_thumb_path:
+                    role = "thumbnail"
                 else:
-                    role = "original" if raw_media_path or media_type in {"image", "sticker"} else "thumbnail"
+                    role = "original"
                 status = str(_value(row, "status") or "pending")
                 path = _resolve_media_path(account, raw_media_path or raw_thumb_path)
                 mime_type = str(
@@ -504,8 +515,12 @@ def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
                 )
                 media_by_message[media_id] = {
                     "media_id": media_id,
-                    "filename": path.name if path else media_id,
-                    "mime_type": mime_type,
+                    # media_id is an internal stable reference, not a
+                    # user-visible filename.  Keep unresolved artifacts
+                    # unnamed so consumers cannot render the reference hash
+                    # as if it were a real downloadable file.
+                    "filename": path.name if path else "",
+                    "mime_type": mime_type if path else "",
                     "role": role,
                     "status": status,
                 }
