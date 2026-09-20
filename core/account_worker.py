@@ -602,16 +602,22 @@ class AccountWorker:
                     continue
                 is_group = bool(chat.get("isGroup"))
                 display_name = str(chat.get("name") or chat_id)
-                last_msg_local_id = int(chat.get("lastMsgLocalId") or 0)
-                last_activity_at = int(chat.get("lastActivityAt") or 0)
-                unread_count = int(chat.get("unreadCount") or 0)
+                try:
+                    last_msg_local_id = int(chat.get("lastMsgLocalId") or 0)
+                except (ValueError, TypeError):
+                    last_msg_local_id = 0
+                last_activity_raw = str(chat.get("lastActivityAt") or "").strip()
+                try:
+                    unread_count = int(chat.get("unreadCount") or 0)
+                except (ValueError, TypeError):
+                    unread_count = 0
 
                 chat_dict = {
                     "account_id": account.account_id,
                     "chat_id": chat_id,
                     "type": "group" if is_group else "private",
                     "display_name": display_name,
-                    "updated_at": parse_timestamp_iso(last_activity_at) if last_activity_at else now_iso(),
+                    "updated_at": last_activity_raw if last_activity_raw else now_iso(),
                     "vendor_specific": {
                         "provider": "agent_wechat",
                         "last_msg_local_id": last_msg_local_id,
@@ -625,8 +631,8 @@ class AccountWorker:
                     wm is None
                     or cold_start
                     or last_msg_local_id > wm.get("last_msg_local_id", 0)
-                    or last_activity_at > wm.get("last_activity_at", 0)
-                    or unread_count > wm.get("unread_count", 0)
+                    or last_activity_raw != wm.get("last_activity_raw", "")
+                    or unread_count != wm.get("unread_count", 0)
                 )
 
                 if not has_changed:
@@ -649,7 +655,7 @@ class AccountWorker:
 
                 self._chat_watermarks[(account.account_id, chat_id)] = {
                     "last_msg_local_id": max_seen_local_id,
-                    "last_activity_at": last_activity_at,
+                    "last_activity_raw": last_activity_raw,
                     "unread_count": unread_count,
                 }
 
