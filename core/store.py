@@ -1426,8 +1426,10 @@ class CoreStore:
             value["media_status"] = media_status
         with self.connection() as conn:
             gate = identity.sync_gate(conn, account_id)
-            instance_uuid = str(gate["instance"]["instance_uuid"])
-            identity_uuid = str(gate["stamp_identity"])
+            instance_uuid = str(message.get("instance_uuid") or gate["instance"]["instance_uuid"])
+            identity_uuid = str(message.get("wechat_identity_uuid") or gate["stamp_identity"])
+            value["instance_uuid"] = instance_uuid
+            value["wechat_identity_uuid"] = identity_uuid
             if value["source_local_id"]:
                 canonical = conn.execute(
                     """
@@ -1537,6 +1539,7 @@ class CoreStore:
         account_id: str,
         chat_id: str,
         *,
+        instance_uuid: str | None = None,
         wechat_identity_uuid: str | None = None,
         cursor: str = "",
         limit: int = 100,
@@ -1557,6 +1560,9 @@ class CoreStore:
                 raise StoreError("invalid_cursor", "cursor is not valid for this Core", details={"field": "cursor"})
         statement = "SELECT * FROM messages WHERE account_id=? AND chat_id=?"
         args: list[Any] = [account_id, chat_id]
+        if instance_uuid:
+            statement += " AND instance_uuid=?"
+            args.append(str(instance_uuid))
         if wechat_identity_uuid:
             statement += " AND wechat_identity_uuid=?"
             args.append(str(wechat_identity_uuid))
@@ -1957,14 +1963,23 @@ class CoreStore:
 
         has_more = len(rows) > limit
         selected = rows[:limit]
-        events = [
-            {
+        events = []
+        for row in selected:
+            ev = {
                 "event_id": row["event_id"], "cursor": str(row["cursor"]), "account_id": row["account_id"],
                 "event_type": row["event_type"], "occurred_at": row["occurred_at"],
                 "payload": parse_json(row["payload_json"], {}),
             }
-            for row in selected
-        ]
+            if row["instance_uuid"] or row["wechat_identity_uuid"]:
+                payload = ev["payload"]
+                if isinstance(payload, dict):
+                    msg = payload.get("message")
+                    if isinstance(msg, dict):
+                        if row["instance_uuid"] and not msg.get("instance_uuid"):
+                            msg["instance_uuid"] = row["instance_uuid"]
+                        if row["wechat_identity_uuid"] and not msg.get("wechat_identity_uuid"):
+                            msg["wechat_identity_uuid"] = row["wechat_identity_uuid"]
+            events.append(ev)
         return {
             "events": events,
             "next_cursor": events[-1]["cursor"] if events else str(cursor),

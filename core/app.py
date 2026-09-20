@@ -713,6 +713,30 @@ class CoreService:
             self._apply_runtime_status(result["status"])
         return result
 
+    def reproject_account(self, account_id: str) -> dict[str, Any]:
+        self.require_account(account_id)
+        with self.store.connection() as conn:
+            gate = identity.sync_gate(conn, account_id)
+            instance_uuid = str(gate["instance"]["instance_uuid"])
+            identity_uuid = str(gate["stamp_identity"])
+            rows = conn.execute("SELECT * FROM messages WHERE account_id=?", (account_id,)).fetchall()
+            reprojected = 0
+            for row in rows:
+                msg = self.store._message_row(row)
+                if instance_uuid:
+                    msg["instance_uuid"] = instance_uuid
+                if identity_uuid:
+                    msg["wechat_identity_uuid"] = identity_uuid
+                self.store._append_event(conn, account_id, "message.updated", {"message": msg})
+                reprojected += 1
+            return {
+                "ok": True,
+                "account_id": account_id,
+                "reprojected_count": reprojected,
+                "instance_uuid": instance_uuid,
+                "wechat_identity_uuid": identity_uuid,
+            }
+
     def runtime_login_status(self, account_id: str) -> dict[str, Any]:
         account = self.require_account(account_id)
         result = self._runtime_request("login_status", account_id=account_id)
@@ -1295,12 +1319,14 @@ class CoreHandler(BaseHTTPRequestHandler):
                     self.service.require_chat(account_id, chat_id)
                     limit = bounded_int(query.get("limit", [""])[0], "limit", default=100, low=1, high=200)
                     identity_filter = query.get("wechat_identity_uuid", [""])[0].strip()
+                    instance_filter = query.get("instance_uuid", [""])[0].strip()
                     if not identity_filter:
                         identity_filter = self.service.identity_messages_view(account_id, chat_id)
                     try:
                         output = self.service.store.list_messages(
                             account_id,
                             chat_id,
+                            instance_uuid=instance_filter or None,
                             wechat_identity_uuid=identity_filter or None,
                             cursor=query.get("cursor", [""])[0],
                             limit=limit,
@@ -1578,6 +1604,9 @@ class CoreHandler(BaseHTTPRequestHandler):
                         return
                     if parts[1] == "update":
                         self._json(200, self.service.update_runtime_account(account_id, payload))
+                        return
+                    if parts[1] == "reproject":
+                        self._json(200, self.service.reproject_account(account_id))
                         return
                     self._json(200, self.service.runtime_account_action(account_id, parts[1]))
                     return

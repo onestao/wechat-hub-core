@@ -251,6 +251,9 @@ def _normalized_message(
     row: sqlite3.Row,
     contacts: dict[str, dict[str, str]],
     media: dict[str, str] | None = None,
+    *,
+    instance_uuid: str = "",
+    wechat_identity_uuid: str = "",
 ) -> dict[str, Any]:
     chat_id = str(_value(row, "chat_username") or _value(row, "message_table"))
     raw_type = str(_value(row, "type_label", "unsupported"))
@@ -334,6 +337,10 @@ def _normalized_message(
         "attributes": attributes,
         "vendor_specific": vendor_specific,
     }
+    if instance_uuid:
+        normalized["instance_uuid"] = instance_uuid
+    if wechat_identity_uuid:
+        normalized["wechat_identity_uuid"] = wechat_identity_uuid
     if media:
         normalized.update(
             {
@@ -405,9 +412,12 @@ def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
 
     # E3: Resolve self profile
     self_wxid = ""
+    identity_uuid = ""
+    instance_uuid = ""
     try:
         binding = store.binding_state(account.account_id)
         identity_uuid = str((binding.get("identity") or {}).get("wechat_identity_uuid") or "")
+        instance_uuid = str(binding.get("instance_uuid") or "")
         wechat_user_id = str((binding.get("identity") or {}).get("wechat_user_id") or account.runtime.get("logged_in_user") or "")
         if identity_uuid and wechat_user_id:
             self_wxid = wechat_user_id
@@ -523,6 +533,8 @@ def _import_account(account: AccountConfig, store: CoreStore) -> dict[str, int]:
                     row,
                     contacts,
                     media=media_by_message.get(message_id),
+                    instance_uuid=instance_uuid,
+                    wechat_identity_uuid=identity_uuid,
                 )
             )
             summary["messages"] += 1
