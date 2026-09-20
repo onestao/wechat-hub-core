@@ -298,12 +298,19 @@ def identity_by_uuid(conn: sqlite3.Connection, wechat_identity_uuid: str) -> dic
 
 def create_identity(conn: sqlite3.Connection, *, wechat_user_id: str = "", nickname: str = "") -> dict[str, Any]:
     now = utc_now()
+    wxid = str(wechat_user_id or "").strip() or None
+    nick = str(nickname or "").strip()
+    if wxid and nick == wxid:
+        nick = ""
+    profile: dict[str, Any] = {"wechat_id": ""}
+    if wxid:
+        profile["hydration_started_at"] = now
     row = {
         "wechat_identity_uuid": new_uuid(),
-        "wechat_user_id": str(wechat_user_id or "").strip() or None,
-        "nickname": str(nickname or ""),
+        "wechat_user_id": wxid,
+        "nickname": nick,
         "avatar_ref": "",
-        "profile_json": "{}",
+        "profile_json": json.dumps(profile, ensure_ascii=False),
         "created_at": now,
         "updated_at": now,
     }
