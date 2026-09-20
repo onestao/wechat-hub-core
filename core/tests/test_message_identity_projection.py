@@ -348,6 +348,154 @@ class MessageIdentityProjectionTest(unittest.TestCase):
         self.assertEqual(res["messages"][0]["instance_uuid"], self.instance_uuid)
         self.assertEqual(res["messages"][0]["wechat_identity_uuid"], self.identity_a)
 
+    def test_criterion_h_rebind_existing_message_update_preserves_identity(self):
+        """H. identity A 创建消息 → rebind B → 同一 A 消息发生内容或媒体状态 update → Core DB 仍为 A → emitted message.updated 仍为 A → Console 消费后仍为 A。"""
+        # 1. Identity A creates message
+        msg_id = "msg-persisted-a-001"
+        msg_in = {
+            "account_id": self.account_id,
+            "message_id": msg_id,
+            "chat_id": self.chat_id,
+            "type": "text",
+            "direction": "incoming",
+            "created_at": "2026-09-20T08:00:00Z",
+            "author": {"member_id": "author-1", "display_name": "Author 1", "is_self": False},
+            "text": "Initial text under identity A",
+        }
+        res_create = self.store.upsert_message(msg_in)
+        self.assertEqual(res_create, "created")
+
+        # Verify Core DB row initially has identity A
+        with self.store.connection() as conn:
+            row = conn.execute(
+                "SELECT instance_uuid, wechat_identity_uuid, text FROM messages WHERE account_id=? AND message_id=?",
+                (self.account_id, msg_id),
+            ).fetchone()
+            self.assertEqual(row["instance_uuid"], self.instance_uuid)
+            self.assertEqual(row["wechat_identity_uuid"], self.identity_a)
+            self.assertEqual(row["text"], "Initial text under identity A")
+
+        # 2. Rebind account to identity B
+        self.store.observe_login(
+            self.account_id,
+            WXID_B,
+            verified_source=identity.VERIFIED_SOURCE_AGENT_AUTH,
+        )
+        switch = self.store.confirm_switch(self.account_id)
+        identity_b = switch["wechat_identity_uuid"]
+        self.assertNotEqual(identity_b, self.identity_a)
+
+        # 3. Same message gets content/media status update
+        # Even if caller passes conflicting caller-level identity parameters, Store authoritative judgment wins
+        msg_update = {
+            "account_id": self.account_id,
+            "message_id": msg_id,
+            "chat_id": self.chat_id,
+            "type": "text",
+            "direction": "incoming",
+            "created_at": "2026-09-20T08:00:00Z",
+            "author": {"member_id": "author-1", "display_name": "Author 1", "is_self": False},
+            "text": "Updated text under rebind B",
+            "instance_uuid": "bogus-caller-instance",
+            "wechat_identity_uuid": identity_b,
+        }
+        res_update = self.store.upsert_message(msg_update)
+        self.assertEqual(res_update, "updated")
+
+        # 4. Verify Core DB row is STILL identity A, NOT identity B
+        with self.store.connection() as conn:
+            row_updated = conn.execute(
+                "SELECT instance_uuid, wechat_identity_uuid, text FROM messages WHERE account_id=? AND message_id=?",
+                (self.account_id, msg_id),
+            ).fetchone()
+            self.assertEqual(row_updated["text"], "Updated text under rebind B")
+            self.assertEqual(row_updated["instance_uuid"], self.instance_uuid)
+            self.assertEqual(row_updated["wechat_identity_uuid"], self.identity_a)
+            self.assertNotEqual(row_updated["wechat_identity_uuid"], identity_b)
+
+        # 5. Verify emitted message.updated event payload is STILL identity A
+        events_page = self.store.poll_events(after="0", limit=200)
+        update_events = [
+            e for e in events_page["events"]
+            if e.get("event_type") == "message.updated"
+            and e.get("payload", {}).get("message", {}).get("message_id") == msg_id
+        ]
+        self.assertEqual(len(update_events), 1)
+        emitted_msg = update_events[0]["payload"]["message"]
+        self.assertEqual(emitted_msg["instance_uuid"], self.instance_uuid)
+        self.assertEqual(emitted_msg["wechat_identity_uuid"], self.identity_a)
+
+        # 6. Verify Console consumption: Console consumes emitted event, message in Console is still identity A
+        try:
+            from wechat_console.store import ConsoleStore
+            console_db_path = Path(self.temp_dir.name) / "console_test.sqlite"
+            console_store = ConsoleStore(console_db_path, Path(self.temp_dir.name) / "archive")
+            console_store.ingest_events(update_events)
+
+            # Console list_messages with identity A finds the message
+            page_a = console_store.list_messages(
+                account_id=self.account_id,
+                chat_id=self.chat_id,
+                instance_uuid=self.instance_uuid,
+                wechat_identity_uuid=self.identity_a,
+            )
+            self.assertEqual(len(list(page_a)), 1)
+            msg_res = list(page_a)[0]
+            self.assertEqual(msg_res["message_id"], msg_id)
+            self.assertEqual(msg_res["text"], "Updated text under rebind B")
+            self.assertEqual(msg_res["instance_uuid"], self.instance_uuid)
+            self.assertEqual(msg_res["wechat_identity_uuid"], self.identity_a)
+
+            # Console list_messages with identity B returns 0
+            page_b = console_store.list_messages(
+                account_id=self.account_id,
+                chat_id=self.chat_id,
+                instance_uuid=self.instance_uuid,
+                wechat_identity_uuid=identity_b,
+            )
+            self.assertEqual(len(list(page_b)), 0)
+        except ImportError:
+            pass
+
+        # 7. Verify one-time enrichment from empty -> non-empty:
+        # A historical message with empty identity fields is enriched with current authoritative binding
+        empty_msg_id = "msg-historical-empty-001"
+        with self.store.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO messages (
+                    account_id, message_id, chat_id, instance_uuid, wechat_identity_uuid,
+                    source_local_id, source_message_table, type, direction, created_at,
+                    author_json, text, media_id, filename, mime_type, target_message_id,
+                    substitutions_json, attributes_json, vendor_json, digest
+                ) VALUES (?, ?, ?, '', '', '', '', 'text', 'incoming', '2026-09-19T00:00:00Z', '{}', 'empty msg', '', '', '', '', '{}', '{}', '{}', 'd1')
+                """,
+                (self.account_id, empty_msg_id, self.chat_id),
+            )
+
+        # Update empty message under current binding (identity B)
+        enrich_msg = {
+            "account_id": self.account_id,
+            "message_id": empty_msg_id,
+            "chat_id": self.chat_id,
+            "type": "text",
+            "direction": "incoming",
+            "created_at": "2026-09-19T00:00:00Z",
+            "author": {"member_id": "author-1", "display_name": "Author 1", "is_self": False},
+            "text": "enriched msg text",
+        }
+        res_enrich = self.store.upsert_message(enrich_msg)
+        self.assertEqual(res_enrich, "updated")
+
+        with self.store.connection() as conn:
+            enriched_row = conn.execute(
+                "SELECT instance_uuid, wechat_identity_uuid, text FROM messages WHERE account_id=? AND message_id=?",
+                (self.account_id, empty_msg_id),
+            ).fetchone()
+            # Successfully enriched from empty to current authoritative binding (identity B)
+            self.assertEqual(enriched_row["wechat_identity_uuid"], identity_b)
+            self.assertTrue(enriched_row["instance_uuid"])
+
 
 if __name__ == "__main__":
     unittest.main()

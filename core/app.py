@@ -713,30 +713,6 @@ class CoreService:
             self._apply_runtime_status(result["status"])
         return result
 
-    def reproject_account(self, account_id: str) -> dict[str, Any]:
-        self.require_account(account_id)
-        with self.store.connection() as conn:
-            gate = identity_v2.sync_gate(conn, account_id)
-            instance_uuid = str(gate["instance"]["instance_uuid"])
-            identity_uuid = str(gate["stamp_identity"])
-            rows = conn.execute("SELECT * FROM messages WHERE account_id=?", (account_id,)).fetchall()
-            reprojected = 0
-            for row in rows:
-                msg = self.store._message_row(row)
-                if instance_uuid:
-                    msg["instance_uuid"] = instance_uuid
-                if identity_uuid:
-                    msg["wechat_identity_uuid"] = identity_uuid
-                self.store._append_event(conn, account_id, "message.updated", {"message": msg})
-                reprojected += 1
-            return {
-                "ok": True,
-                "account_id": account_id,
-                "reprojected_count": reprojected,
-                "instance_uuid": instance_uuid,
-                "wechat_identity_uuid": identity_uuid,
-            }
-
     def runtime_login_status(self, account_id: str) -> dict[str, Any]:
         account = self.require_account(account_id)
         result = self._runtime_request("login_status", account_id=account_id)
@@ -1604,9 +1580,6 @@ class CoreHandler(BaseHTTPRequestHandler):
                         return
                     if parts[1] == "update":
                         self._json(200, self.service.update_runtime_account(account_id, payload))
-                        return
-                    if parts[1] == "reproject":
-                        self._json(200, self.service.reproject_account(account_id))
                         return
                     self._json(200, self.service.runtime_account_action(account_id, parts[1]))
                     return

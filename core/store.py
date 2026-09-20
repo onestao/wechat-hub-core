@@ -788,23 +788,34 @@ class CoreStore:
                 [(int(row["rowid"]),) for row in duplicates[1:]],
             )
 
-    def _append_event(self, conn: sqlite3.Connection, account_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _append_event(
+        self,
+        conn: sqlite3.Connection,
+        account_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        instance_uuid: str | None = None,
+        wechat_identity_uuid: str | None = None,
+    ) -> dict[str, Any]:
         occurred_at = utc_now()
         event_id = f"event-{uuid.uuid4().hex}"
-        instance_uuid, identity_uuid = identity.stamp_ref(conn, account_id)
+        default_inst, default_ident = identity.stamp_ref(conn, account_id)
+        inst = default_inst if instance_uuid is None else instance_uuid
+        ident = default_ident if wechat_identity_uuid is None else wechat_identity_uuid
         cursor = conn.execute(
             """
             INSERT INTO events (event_id, account_id, instance_uuid, wechat_identity_uuid, event_type, occurred_at, payload_json)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (event_id, account_id, instance_uuid, identity_uuid, event_type, occurred_at, compact_json(payload)),
+            (event_id, account_id, inst, ident, event_type, occurred_at, compact_json(payload)),
         ).lastrowid
         return {
             "event_id": event_id,
             "cursor": str(cursor),
             "account_id": account_id,
-            "instance_uuid": instance_uuid,
-            "wechat_identity_uuid": identity_uuid,
+            "instance_uuid": inst,
+            "wechat_identity_uuid": ident,
             "event_type": event_type,
             "occurred_at": occurred_at,
             "payload": payload,
@@ -1426,10 +1437,8 @@ class CoreStore:
             value["media_status"] = media_status
         with self.connection() as conn:
             gate = identity.sync_gate(conn, account_id)
-            instance_uuid = str(message.get("instance_uuid") or gate["instance"]["instance_uuid"])
-            identity_uuid = str(message.get("wechat_identity_uuid") or gate["stamp_identity"])
-            value["instance_uuid"] = instance_uuid
-            value["wechat_identity_uuid"] = identity_uuid
+            gate_instance_uuid = str(gate["instance"]["instance_uuid"] or "").strip()
+            gate_identity_uuid = str(gate["stamp_identity"] or "").strip()
             if value["source_local_id"]:
                 canonical = conn.execute(
                     """
@@ -1442,10 +1451,23 @@ class CoreStore:
                 if canonical is not None:
                     value["message_id"] = str(canonical["message_id"])
                     message_id = value["message_id"]
+            before = conn.execute(
+                "SELECT digest, instance_uuid, wechat_identity_uuid FROM messages WHERE account_id=? AND message_id=?",
+                (account_id, message_id),
+            ).fetchone()
+            if before is None:
+                effective_instance_uuid = gate_instance_uuid
+                effective_identity_uuid = gate_identity_uuid
+            else:
+                existing_instance = str(before["instance_uuid"] or "").strip()
+                existing_identity = str(before["wechat_identity_uuid"] or "").strip()
+                effective_instance_uuid = existing_instance if existing_instance else gate_instance_uuid
+                effective_identity_uuid = existing_identity if existing_identity else gate_identity_uuid
+            value["instance_uuid"] = effective_instance_uuid
+            value["wechat_identity_uuid"] = effective_identity_uuid
             value_digest = digest(
                 {key: item for key, item in value.items() if key not in ("instance_uuid", "wechat_identity_uuid")}
             )
-            before = conn.execute("SELECT digest FROM messages WHERE account_id=? AND message_id=?", (account_id, message_id)).fetchone()
             conn.execute(
                 """
                 INSERT INTO messages (
@@ -1466,7 +1488,7 @@ class CoreStore:
                     wechat_identity_uuid=CASE WHEN messages.wechat_identity_uuid<>'' THEN messages.wechat_identity_uuid ELSE excluded.wechat_identity_uuid END
                 """,
                 (
-                    account_id, message_id, value["chat_id"], instance_uuid, identity_uuid,
+                    account_id, message_id, value["chat_id"], effective_instance_uuid, effective_identity_uuid,
                     value["source_local_id"], value["source_message_table"],
                     value["type"], value["direction"], value["created_at"],
                     compact_json(author), value["text"], value["media_id"], value["filename"], value["mime_type"],
@@ -1482,7 +1504,14 @@ class CoreStore:
             # own send.
             self._reconcile_text_echo(conn, value)
             if before is None or before["digest"] != value_digest:
-                self._append_event(conn, account_id, event_type, {"message": value})
+                self._append_event(
+                    conn,
+                    account_id,
+                    event_type,
+                    {"message": value},
+                    instance_uuid=effective_instance_uuid,
+                    wechat_identity_uuid=effective_identity_uuid,
+                )
         return "created" if before is None else "updated" if before["digest"] != value_digest else "unchanged"
 
     def upsert_media(self, media: dict[str, Any]) -> bool:
