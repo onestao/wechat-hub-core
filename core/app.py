@@ -465,6 +465,10 @@ class CoreService:
             "invalid_request": 400,
             "account_not_found": 404,
             "account_exists": 409,
+            "consumer_not_configured": 409,
+            "consumer_foreign_conflict": 409,
+            "consumer_mutual_exclusion_violation": 409,
+            "consumer_image_unavailable": 503,
             "runtime_management_unavailable": 503,
             "invalid_runtime_response": 502,
         }.get(error.code, 500)
