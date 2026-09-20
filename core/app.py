@@ -8,6 +8,7 @@ import base64
 import binascii
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import threading
@@ -970,6 +971,83 @@ class CoreService:
             "mutual_exclusion": True,
         }
 
+    def resolve_media(self, account_id: str, media_id: str) -> tuple[bytes, str, str, str, str]:
+        """Resolve media bytes, MIME type, filename, disposition, and status with on-demand lazy fetch for agent_wechat."""
+        account = self.registry.get(account_id)
+        if account is None:
+            raise ApiError(404, "account_not_found", f"Unknown account: {account_id}")
+
+        # 1. Check existing media in CoreStore
+        media = self.store.media(account_id, media_id)
+        if media and media.get("local_path"):
+            local_path = Path(str(media["local_path"]))
+            if local_path.is_file():
+                content = local_path.read_bytes()
+                mime_type = str(media.get("mime_type") or mimetypes.guess_type(str(media.get("filename") or ""))[0] or "application/octet-stream")
+                filename = str(media.get("filename") or media_id)
+                disposition = str(media.get("disposition") or "inline")
+                status = str(media.get("status") or "ready")
+                return content, mime_type, filename, disposition, status
+
+        # 2. Check if this is an agent_wechat provider message
+        msg = self.store.get_message_by_media_id(account_id, media_id)
+        if msg is None:
+            raise ApiError(404, "media_not_found", f"Unknown media_id for {account_id}: {media_id}")
+
+        vendor = msg.get("vendor_specific") or {}
+        provider = str(vendor.get("provider") or account.runtime_provider or "")
+        source_local_id = vendor.get("source_local_id") or msg.get("source_local_id")
+        chat_id = str(msg.get("chat_id") or "")
+
+        if provider != "agent_wechat" or not source_local_id or not chat_id:
+            raise ApiError(404, "media_not_found", f"Media bytes are unavailable for {media_id}")
+
+        # 3. Fetch on-demand from agent-wechat API
+        from .agent_wechat import AgentWechatClient, AgentWechatError
+
+        try:
+            client = AgentWechatClient.from_account(account)
+            result = client.get_media(chat_id, source_local_id)
+        except AgentWechatError as exc:
+            raise ApiError(exc.status_code, exc.code, str(exc), exc.details) from exc
+
+        media_type = str(result.get("type") or "")
+        b64_data = result.get("data")
+        if media_type == "pending" or not b64_data:
+            raise ApiError(202, "media_pending", "Media content is still downloading in WeChat client", {"media_id": media_id})
+        if media_type == "unsupported":
+            raise ApiError(404, "media_unsupported", "Media format is unsupported by agent-wechat", {"media_id": media_id})
+
+        try:
+            content = base64.b64decode(b64_data)
+        except Exception as exc:
+            raise ApiError(502, "media_decode_error", f"Failed decoding base64 media payload: {exc}") from exc
+
+        fmt = str(result.get("format") or "")
+        detected_filename = str(result.get("filename") or msg.get("filename") or f"{media_id}.{fmt or 'bin'}")
+        mime_type = mimetypes.guess_type(detected_filename)[0] or (f"image/{fmt}" if fmt in ("jpeg", "png", "gif") else "application/octet-stream")
+
+        # 4. Cache to disk
+        target_dir = self.media_root / account_id / (media_type or "media")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        safe_fname = re.sub(r'[\r\n/\\:*?"<>|]', "_", detected_filename)
+        target_path = target_dir / safe_fname
+        target_path.write_bytes(content)
+
+        # 5. Persist to store
+        self.store.upsert_media({
+            "account_id": account_id,
+            "media_id": media_id,
+            "filename": safe_fname,
+            "mime_type": mime_type,
+            "local_path": str(target_path),
+            "disposition": "inline",
+            "role": "original",
+            "status": "ready",
+        })
+
+        return content, mime_type, safe_fname, "inline", "ready"
+
     def resolve_avatar(
         self,
         avatar_key: str,
@@ -1383,21 +1461,15 @@ class CoreHandler(BaseHTTPRequestHandler):
                 if not account_id:
                     raise ApiError(400, "invalid_request", "account_id query parameter is required", {"field": "account_id"})
                 self.service.require_account(account_id)
-                media = self.service.store.media(account_id, media_id)
-                if media is None:
-                    raise ApiError(404, "media_not_found", f"Unknown media_id for {account_id}: {media_id}")
-                local_path = Path(str(media["local_path"]))
-                if not local_path.exists() or not local_path.is_file():
-                    raise ApiError(404, "media_not_found", f"Media bytes are unavailable for {media_id}")
-                content = local_path.read_bytes()
-                filename = re.sub(r"[\r\n\"]", "_", str(media["filename"]))
+                content, mime_type, filename, disposition, status = self.service.resolve_media(account_id, media_id)
+                safe_filename = re.sub(r'[\r\n"]', "_", filename)
                 self.send_response(200)
-                self.send_header("Content-Type", str(media["mime_type"]))
+                self.send_header("Content-Type", mime_type)
                 self.send_header("Content-Length", str(len(content)))
-                self.send_header("Content-Disposition", f'{media["disposition"]}; filename="{filename}"')
+                self.send_header("Content-Disposition", f'{disposition}; filename="{safe_filename}"')
                 self.send_header("X-Media-Id", media_id)
-                self.send_header("X-Media-Role", str(media.get("role") or "original"))
-                self.send_header("X-Media-Status", str(media.get("status") or ""))
+                self.send_header("X-Media-Role", "original")
+                self.send_header("X-Media-Status", status)
                 self.end_headers()
                 self.wfile.write(content)
                 return

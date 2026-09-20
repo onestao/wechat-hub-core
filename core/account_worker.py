@@ -177,6 +177,9 @@ class AccountWorker:
     def __init__(self, registry: AccountRegistry, store: CoreStore) -> None:
         self.registry = registry
         self.store = store
+        self._chat_watermarks: dict[tuple[str, str], dict[str, Any]] = {}
+        self._account_initialized: set[str] = set()
+        self._contact_cycle_count: dict[str, int] = {}
 
     def _assert_source_provenance(self, account: AccountConfig) -> None:
         """Fail closed when the selected source directory belongs to another wxid.
@@ -387,6 +390,9 @@ class AccountWorker:
                             "source_db_dir": str(account.source_db_dir),
                         },
                     )
+            if account.runtime_provider == "agent_wechat":
+                return self._run_agent_wechat_account(account, status=status, started=started)
+
             # These existing upstream modules require production image dependencies
             # such as pycryptodome.  Keep API-only consumers independent of a live
             # decrypt environment until a sync cycle is explicitly requested.
@@ -526,6 +532,16 @@ class AccountWorker:
                 "error": str(exc),
             }
             state = "error"
+        return self._finalize_sync(account, state=state, status=status, started=started)
+
+    def _finalize_sync(
+        self,
+        account: AccountConfig,
+        *,
+        state: str,
+        status: dict[str, Any],
+        started: float,
+    ) -> dict[str, Any]:
         status["finished_at"] = now_iso()
         status["elapsed_seconds"] = round(time.monotonic() - started, 3)
         write_json(account.sync_status_file, status)
@@ -548,6 +564,152 @@ class AccountWorker:
             status["persistence_error"] = f"{type(exc).__name__}: {exc}"
             write_json(account.sync_status_file, status)
         return status
+
+    def _run_agent_wechat_account(
+        self,
+        account: AccountConfig,
+        *,
+        status: dict[str, Any],
+        started: float,
+    ) -> dict[str, Any]:
+        from .agent_wechat import AgentWechatClient, AgentWechatError, normalize_agent_message, parse_timestamp_iso
+
+        state = "online"
+        try:
+            binding_info = self.store.binding_state(account.account_id)
+            bound_wxid = str((binding_info.get("identity") or {}).get("wechat_user_id") or "").strip()
+
+            client = AgentWechatClient.from_account(account)
+
+            # Health check
+            health = client.health()
+            if isinstance(health, dict) and health.get("status") in ("degraded", "error"):
+                status["degraded_reason"] = f"agent-wechat health: {health.get('status')}"
+                state = "degraded"
+
+            chats_synced = 0
+            messages_synced = 0
+            message_changes = 0
+
+            cold_start = account.account_id not in self._account_initialized
+            if cold_start:
+                self._account_initialized.add(account.account_id)
+
+            chats = client.list_chats()
+            for chat in chats:
+                chat_id = str(chat.get("id") or chat.get("username") or "").strip()
+                if not chat_id:
+                    continue
+                is_group = bool(chat.get("isGroup"))
+                display_name = str(chat.get("name") or chat_id)
+                last_msg_local_id = int(chat.get("lastMsgLocalId") or 0)
+                last_activity_at = int(chat.get("lastActivityAt") or 0)
+                unread_count = int(chat.get("unreadCount") or 0)
+
+                chat_dict = {
+                    "account_id": account.account_id,
+                    "chat_id": chat_id,
+                    "type": "group" if is_group else "private",
+                    "display_name": display_name,
+                    "updated_at": parse_timestamp_iso(last_activity_at) if last_activity_at else now_iso(),
+                    "vendor_specific": {
+                        "provider": "agent_wechat",
+                        "last_msg_local_id": last_msg_local_id,
+                    },
+                }
+                self.store.upsert_chat(chat_dict)
+                chats_synced += 1
+
+                wm = self._chat_watermarks.get((account.account_id, chat_id))
+                has_changed = (
+                    wm is None
+                    or cold_start
+                    or last_msg_local_id > wm.get("last_msg_local_id", 0)
+                    or last_activity_at > wm.get("last_activity_at", 0)
+                    or unread_count > wm.get("unread_count", 0)
+                )
+
+                if not has_changed:
+                    continue
+
+                # Changed: fetch recent messages (incremental)
+                limit = 50 if cold_start else 30
+                raw_messages = client.list_messages(chat_id, limit=limit)
+                max_seen_local_id = last_msg_local_id
+
+                for raw_msg in raw_messages:
+                    local_id = int(raw_msg.get("localId") or 0)
+                    if local_id > max_seen_local_id:
+                        max_seen_local_id = local_id
+                    norm = normalize_agent_message(account.account_id, raw_msg, bound_wxid=bound_wxid)
+                    res = self.store.upsert_message(norm)
+                    messages_synced += 1
+                    if res != "unchanged":
+                        message_changes += 1
+
+                self._chat_watermarks[(account.account_id, chat_id)] = {
+                    "last_msg_local_id": max_seen_local_id,
+                    "last_activity_at": last_activity_at,
+                    "unread_count": unread_count,
+                }
+
+            # Periodic or cold-start contacts sync
+            contact_cycles = self._contact_cycle_count.get(account.account_id, 0)
+            contacts_synced = 0
+            if cold_start or contact_cycles % 12 == 0:
+                try:
+                    raw_contacts = client.list_contacts(limit=500)
+                    for rc in raw_contacts:
+                        uname = str(rc.get("username") or "").strip()
+                        if uname:
+                            self.store.upsert_contact(account.account_id, {
+                                "member_id": uname,
+                                "remark": str(rc.get("remark") or "").strip(),
+                                "nickname": str(rc.get("nickName") or "").strip(),
+                                "alias": str(rc.get("alias") or "").strip(),
+                                "small_head_url": str(rc.get("smallHeadUrl") or "").strip(),
+                                "avatar_ref": str(rc.get("smallHeadUrl") or "").strip(),
+                            })
+                            contacts_synced += 1
+                except Exception as exc:
+                    logger.warning("AgentWechat contacts sync error for %s: %s", account.account_id, exc)
+            self._contact_cycle_count[account.account_id] = contact_cycles + 1
+
+            status.update({
+                "ok": True,
+                "completeness": "complete",
+                "chats": chats_synced,
+                "messages": messages_synced,
+                "message_changes": message_changes,
+                "contacts": contacts_synced,
+                "freshness": {
+                    "status": "fresh",
+                    "completeness": "complete",
+                    "mode": "agent_wechat_realtime",
+                },
+            })
+            if state != "degraded":
+                state = "online"
+        except AgentWechatError as exc:
+            status["ok"] = False
+            status["error"] = str(exc)
+            status["degraded_reason"] = f"agent-wechat error: {exc.code} ({exc})"
+            state = "degraded"
+        except IdentityError as exc:
+            status["error"] = str(exc)
+            status["identity_binding"] = {"code": exc.code, **exc.details}
+            state = "degraded"
+        except Exception as exc:
+            status["error"] = str(exc)
+            status["ok"] = False
+            status["freshness"] = {
+                "status": "error",
+                "completeness": "unknown",
+                "error": str(exc),
+            }
+            state = "error"
+
+        return self._finalize_sync(account, state=state, status=status, started=started)
 
     def run_once(self, *, force_refresh: bool = False) -> dict[str, Any]:
         results: list[dict[str, Any]] = []

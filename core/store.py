@@ -1558,6 +1558,18 @@ class CoreStore:
             row = conn.execute("SELECT * FROM media WHERE account_id=? AND media_id=?", (account_id, media_id)).fetchone()
         return dict(row) if row else None
 
+    def get_message_by_media_id(self, account_id: str, media_id: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM messages
+                WHERE account_id=? AND (media_id=? OR message_id=?)
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (account_id, media_id, media_id),
+            ).fetchone()
+        return self._message_row(row) if row else None
+
     # ------------------------------------------------------------------
     # Identity-keyed data access (contract B8) — every business entity is
     # queryable by wechat_identity_uuid; the account-scoped compat layer

@@ -437,6 +437,16 @@ class AgentWechatSenderDriver:
             raise RuntimeError(f"agent-wechat token file is empty for {account.account_id}")
         return token
 
+    @staticmethod
+    def _token(account: AccountConfig) -> str:
+        token_file = Path(str(account.runtime.get("agent_wechat_token_file") or ""))
+        if not token_file.is_file():
+            raise RuntimeError(f"agent-wechat token file is unavailable for {account.account_id}")
+        token = token_file.read_text(encoding="utf-8").strip()
+        if not token:
+            raise RuntimeError(f"agent-wechat token file is empty for {account.account_id}")
+        return token
+
     def _request(self, account: AccountConfig, payload: dict[str, Any]) -> dict[str, Any]:
         base_url = str(account.runtime.get("agent_wechat_base_url") or "").rstrip("/")
         if not base_url:
@@ -472,6 +482,7 @@ class AgentWechatSenderDriver:
             result = json.loads(raw.decode("utf-8")) if raw else {}
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RuntimeError("agent-wechat send returned invalid JSON") from exc
+        return result
         if not isinstance(result, dict):
             raise RuntimeError("agent-wechat send response must be an object")
         if result.get("success") is False or result.get("ok") is False:
