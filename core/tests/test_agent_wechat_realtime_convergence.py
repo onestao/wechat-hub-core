@@ -173,6 +173,7 @@ class AccountWorkerPaginationAndBacklogTest(unittest.TestCase):
         self.registry = AccountRegistry([], self.registry_file)
 
     def tearDown(self) -> None:
+        self.store.close()
         self.tmp_dir.cleanup()
 
     def _create_agent_account(self, account_id: str = "acc_agent") -> AccountConfig:
@@ -464,6 +465,7 @@ class LazyMediaCorrectnessTest(unittest.TestCase):
         self.registry = AccountRegistry([], self.registry_file)
 
     def tearDown(self) -> None:
+        self.store.close()
         self.tmp_dir.cleanup()
 
     def _create_agent_account(self, account_id: str = "acc_media") -> AccountConfig:
@@ -824,6 +826,62 @@ class LazyMediaCorrectnessTest(unittest.TestCase):
         self.assertEqual(saved_media["filename"], "dataset_12mb.bin")
         self.assertEqual(saved_media["role"], "original")
         self.assertEqual(saved_media["status"], "ready")
+
+    def test_agent_client_real_large_file_streaming_over_10mb(self) -> None:
+        """P1 Integration: Real socket HTTP streaming of >10MB file from agent-server file route."""
+        import http.server
+        import threading
+
+        fixture_size = 12 * 1024 * 1024  # 12MB
+        chunk_size = 64 * 1024
+        received_auth: list[str] = []
+
+        class StreamHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                received_auth.append(self.headers.get("Authorization", ""))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(fixture_size))
+                self.send_header("X-Media-Status", "ready")
+                self.send_header("X-Media-Filename", "stream_12mb.bin")
+                self.send_header("X-Media-Role", "original")
+                self.end_headers()
+
+                chunk = b"S" * chunk_size
+                remaining = fixture_size
+                while remaining > 0:
+                    to_write = min(chunk_size, remaining)
+                    self.wfile.write(chunk[:to_write])
+                    remaining -= to_write
+
+            def log_message(self, format: str, *args: Any) -> None:
+                pass  # Suppress console noise
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), StreamHandler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+
+        try:
+            client = AgentWechatClient(f"http://127.0.0.1:{port}", "real-stream-token")
+            target_file = self.root / "streamed_12mb.bin"
+            meta = client.fetch_media_to_file("chat_stream", 9002, target_file)
+
+            self.assertEqual(meta["status"], "ready")
+            self.assertEqual(meta.get("x-media-filename"), "stream_12mb.bin")
+            self.assertEqual(meta.get("x-media-role"), "original")
+            self.assertTrue(target_file.exists())
+            self.assertEqual(target_file.stat().st_size, fixture_size)
+            self.assertIn("Bearer real-stream-token", received_auth[0])
+
+            # Verify content integrity
+            with open(target_file, "rb") as f:
+                first_chunk = f.read(chunk_size)
+                self.assertEqual(first_chunk, b"S" * chunk_size)
+        finally:
+            server.shutdown()
+            server.server_close()
+            t.join(timeout=2)
 
 
 if __name__ == "__main__":

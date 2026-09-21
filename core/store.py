@@ -2926,5 +2926,8 @@ class CoreStore:
         return receipt
 
     def close(self) -> None:
-        # Connections are deliberately short-lived so a process crash cannot keep a lock.
-        return
+        try:
+            with self.connection() as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        except Exception:
+            pass
