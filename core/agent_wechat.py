@@ -13,12 +13,16 @@ import json
 import logging
 import mimetypes
 import re
+import shutil
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from memory.memory_ingest import content_hash, source_message_identity
 
 logger = logging.getLogger(__name__)
 
@@ -52,110 +56,29 @@ class AgentWechatError(Exception):
         self.details = details or {}
 
 
-def content_hash(*parts: Any) -> str:
-    """Compute content SHA-256 hash strictly matching legacy memory_ingest.content_hash."""
-    h = hashlib.sha256()
-    for part in parts:
-        if part is None:
-            h.update(b"\x00")
-        elif isinstance(part, bytes):
-            h.update(part)
-        else:
-            h.update(str(part).encode("utf-8", errors="replace"))
-        h.update(b"\x1f")
-    return h.hexdigest()
-
-
 def canonical_message_id(chat_id: str, local_id: int | str) -> str:
-    """Generate deterministic message ID strictly identical to legacy source_message_identity hash.
+    """Generate deterministic message ID strictly identical to legacy source_message_identity hash."""
+    return content_hash(source_message_identity(str(chat_id).strip(), "", int(local_id)))
 
-    Identity string: f"chat:{chat_id}:local:{local_id}"
-    Result: content_hash(identity)
+
+def map_agent_message_kind(raw_msg: dict[str, Any]) -> tuple[str, int | None, str]:
+    """Map canonical provider message fields to canonical (kind, subtype, filename).
+
+    Core accepts authoritative provider fields: kind, subtype, filename.
+    Unknown types default to 'unknown'; Core does not guess or parse XML.
     """
-    scope = f"chat:{str(chat_id).strip()}"
-    identity = f"{scope}:local:{int(local_id)}"
-    return content_hash(identity)
+    kind = str(raw_msg.get("kind") or "").strip().lower()
+    subtype = raw_msg.get("subtype")
+    if subtype is not None:
+        try:
+            subtype = int(subtype)
+        except (ValueError, TypeError):
+            subtype = None
+    filename = str(raw_msg.get("filename") or "").strip()
 
-
-def _extract_xml_tag(xml: str, tag: str) -> str | None:
-    open_tag = f"<{tag}>"
-    close_tag = f"</{tag}>"
-    start = xml.find(open_tag)
-    if start == -1:
-        return None
-    start += len(open_tag)
-    end = xml.find(close_tag, start)
-    if end == -1:
-        return None
-    val = xml[start:end].strip()
-    if val.startswith("<![CDATA[") and val.endswith("]]>"):
-        val = val[9:-3].strip()
-    return val if val else None
-
-
-def _extract_xml_attr(xml: str, attr: str) -> str | None:
-    pattern = rf'{attr}="([^"]*)"'
-    m = re.search(pattern, xml)
-    return m.group(1).strip() if m else None
-
-
-def map_agent_message_kind(
-    raw_type: int,
-    content: str,
-    reply: Any = None,
-    explicit_kind: str = "",
-    explicit_subtype: int | None = None,
-) -> tuple[str, int | None, str]:
-    """Map agent-wechat raw message fields to canonical (kind, subtype, filename).
-
-    kind strictly in: text, image, sticker, voice, video, file, link, reply, system, unknown.
-    """
-    if explicit_kind and explicit_kind in CANONICAL_KINDS:
-        return explicit_kind, explicit_subtype, ""
-
-    base = raw_type & 0x7FFFFFFF
-    subtype: int | None = explicit_subtype
-
-    # Reply check
-    if reply or (base == 49 and ("<refermsg>" in content or "<type>57</type>" in content)):
-        return "reply", 57, ""
-
-    if base == 1:
-        return "text", None, ""
-    if base == 3:
-        return "image", None, ""
-    if base == 34:
-        return "voice", None, ""
-    if base == 43:
-        return "video", None, ""
-    if base == 47:
-        return "sticker", None, ""
-    if base in (10000, 10002):
-        return "system", None, ""
-
-    if base == 49:
-        # App message
-        appmsg_type = _extract_xml_tag(content, "type")
-        parsed_sub = None
-        if appmsg_type:
-            try:
-                parsed_sub = int(appmsg_type)
-            except (ValueError, TypeError):
-                pass
-        subtype = parsed_sub if parsed_sub is not None else explicit_subtype
-
-        if subtype == 6 or "<type>6</type>" in content:
-            # File
-            title = _extract_xml_tag(content, "title") or ""
-            return "file", 6, title
-        if subtype in (3, 4, 5) or any(f"<type>{t}</type>" in content for t in (3, 4, 5)) or content.startswith("[Link]"):
-            return "link", subtype or 5, ""
-        if subtype == 57 or "<refermsg>" in content:
-            return "reply", 57, ""
-
-        return "unknown", subtype, ""
-
-    return "unknown", None, ""
+    if kind in CANONICAL_KINDS:
+        return kind, subtype, filename
+    return "unknown", subtype, filename
 
 
 def parse_timestamp_iso(ts: Any) -> str:
@@ -204,19 +127,7 @@ def normalize_agent_message(
     raw_type = int(msg.get("type") or 1)
     content = str(msg.get("content") or "")
     reply = msg.get("reply")
-    explicit_kind = str(msg.get("kind") or "")
-    explicit_subtype = msg.get("subtype")
-    explicit_filename = str(msg.get("filename") or "")
-
-    kind, subtype, detected_filename = map_agent_message_kind(
-        raw_type,
-        content,
-        reply=reply,
-        explicit_kind=explicit_kind,
-        explicit_subtype=explicit_subtype,
-    )
-
-    filename = explicit_filename or detected_filename
+    kind, subtype, filename = map_agent_message_kind(msg)
 
     # Determine message ID via canonical SHA-256 hash (strict parity with legacy)
     message_id = canonical_message_id(chat_id, local_id)
@@ -497,6 +408,91 @@ class AgentWechatClient:
         if isinstance(res, dict):
             return res
         return {}
+
+    def fetch_media_to_file(
+        self,
+        chat_id: str,
+        local_id: int | str,
+        target_path: Path,
+        timeout: float = 45.0,
+    ) -> dict[str, str]:
+        """Fetch media directly to target file path using streaming copy.
+
+        Handles:
+        1. Direct streaming from agent-wechat.
+        2. URL-backed CDN stickers: downloads from CDN URL without AgentWechat Authorization header.
+        3. Pending / unsupported status propagation.
+        """
+        path = f"/api/messages/{urllib.parse.quote(str(chat_id), safe='')}/media/{int(local_id)}?raw=true"
+        url = f"{self.base_url}{path}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "*/*",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                headers = {k.lower(): str(v) for k, v in resp.headers.items()}
+                status = str(headers.get("x-media-status") or "ready").lower()
+
+                if status == "unsupported":
+                    return {"status": "unsupported", **headers}
+                if status == "pending":
+                    return {"status": "pending", **headers}
+
+                cdn_url = headers.get("x-media-url")
+                if cdn_url:
+                    # Fetch from CDN: NEVER include AgentWechat Authorization header to CDN
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    cdn_req = urllib.request.Request(cdn_url, headers={"User-Agent": "WeChatHub/0.1.0"})
+                    try:
+                        with urllib.request.urlopen(cdn_req, timeout=15.0) as cdn_resp:
+                            with open(target_path, "wb") as f_out:
+                                shutil.copyfileobj(cdn_resp, f_out, length=64 * 1024)
+                    except Exception as exc:
+                        raise AgentWechatError(f"CDN download failed: {exc}", status_code=504) from exc
+                    return {"status": "ready", **headers}
+
+                # Direct stream copy to target file
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(target_path, "wb") as f_out:
+                    shutil.copyfileobj(resp, f_out, length=64 * 1024)
+
+                if target_path.stat().st_size == 0:
+                    target_path.unlink(missing_ok=True)
+                    return {"status": "pending", **headers}
+
+                return {"status": "ready", **headers}
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return {"status": "unsupported", "x-media-status": "unsupported"}
+            if exc.code == 202:
+                return {"status": "pending", "x-media-status": "pending"}
+            raise AgentWechatError(f"HTTP {exc.code}: {exc.reason}", status_code=exc.code) from exc
+        except AgentWechatError:
+            raise
+        except Exception as exc:
+            raise AgentWechatError(f"Connection failed: {exc}", status_code=502) from exc
+
+    def get_media_raw(self, chat_id: str, local_id: int | str, timeout: float = 45.0) -> tuple[bytes, dict[str, str]]:
+        """Fetch raw binary media directly from agent-wechat API with streaming/raw support.
+
+        Bypasses JSON/base64 size limitations and streams data directly.
+        Returns: (bytes, headers_dict)
+        """
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            headers = self.fetch_media_to_file(chat_id, local_id, tmp_path, timeout=timeout)
+            if headers.get("status") == "ready" and tmp_path.is_file():
+                data = tmp_path.read_bytes()
+            else:
+                data = b""
+            return data, headers
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     def send_message(self, payload: dict[str, Any], timeout: float = 45.0) -> dict[str, Any]:
         """Send message via agent-wechat API."""

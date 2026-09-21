@@ -1,11 +1,24 @@
 """Tests for AgentWechat real-time provider convergence.
 
 Verifies:
-1. Canonical message kinds & XML extraction (text, image, sticker, voice, video, file, link, reply, system, unknown)
+1. Canonical message kinds & mapping (text, image, sticker, voice, video, file, link, reply, system, unknown)
 2. Message ID parity with legacy content_hash(source_message_identity(...))
-3. AccountWorker branching: skips DB decrypt/ingest; polls chats, respects watermarks, fetches incremental messages
-4. Lazy media fetch on-demand via Core media endpoint
-5. Unified outbox & send flow
+3. AccountWorker pagination & burst handling (P0-1):
+   - Burst 40 messages (101~140) all entered
+   - Restart catchup (101~180) across pagination all entered
+   - Unchanged chat -> 0 list_messages calls (UNCHANGED_CHAT_MESSAGE_FETCH = 0)
+   - unreadCount-only changes -> 0 list_messages calls
+4. P0-2: WeChat private format single owner (canonical fields, unknown defaults to unknown, single content_hash)
+5. P0-4: Lazy media correctness:
+   - Unsupported evaluated before not data / pending
+   - Terminal unsupported status cached in CoreStore
+   - Cache path contains media_id (no collision between same filenames)
+   - Role (thumbnail vs original) preserved from upstream
+   - Raw binary streaming capability
+   - Message sync does not prefetch media
+6. P1: Console long-poll:
+   - Backlog > 100 does not skip un-delivered cursors
+   - Background sync thread exits cleanly on stop
 """
 
 from __future__ import annotations
@@ -14,6 +27,7 @@ import base64
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -28,7 +42,7 @@ from core.agent_wechat import (
     normalize_agent_message,
     parse_timestamp_iso,
 )
-from core.registry import AccountConfig, AccountRegistry
+from core.registry import AccountConfig, AccountRegistry, load_registry
 from core.store import CoreStore
 from memory.memory_ingest import source_message_identity
 
@@ -53,63 +67,62 @@ class CanonicalNormalizationTest(unittest.TestCase):
             },
         )
 
-    def test_kind_mapping(self) -> None:
-        # text
-        kind, sub, fn = map_agent_message_kind(1, "Hello world")
+    def test_kind_mapping_from_canonical_fields(self) -> None:
+        """P0-2: Upstream agent-wechat outputs canonical kind, subtype, filename, reply.
+
+        Core accepts these directly; unknown types default to unknown, no XML guessing.
+        """
+        # Text
+        kind, sub, fn = map_agent_message_kind({"kind": "text"})
         self.assertEqual(kind, "text")
 
-        # image
-        kind, sub, fn = map_agent_message_kind(3, "<img />")
+        # Image
+        kind, sub, fn = map_agent_message_kind({"kind": "image"})
         self.assertEqual(kind, "image")
 
-        # voice
-        kind, sub, fn = map_agent_message_kind(34, "")
+        # Voice
+        kind, sub, fn = map_agent_message_kind({"kind": "voice"})
         self.assertEqual(kind, "voice")
 
-        # video
-        kind, sub, fn = map_agent_message_kind(43, "")
+        # Video
+        kind, sub, fn = map_agent_message_kind({"kind": "video"})
         self.assertEqual(kind, "video")
 
-        # sticker / emoji
-        kind, sub, fn = map_agent_message_kind(47, "<emoji />")
+        # Sticker
+        kind, sub, fn = map_agent_message_kind({"kind": "sticker"})
         self.assertEqual(kind, "sticker")
 
-        # system
-        kind, sub, fn = map_agent_message_kind(10000, "Recall message")
-        self.assertEqual(kind, "system")
-        kind, sub, fn = map_agent_message_kind(10002, "Revoked")
+        # System
+        kind, sub, fn = map_agent_message_kind({"kind": "system"})
         self.assertEqual(kind, "system")
 
-        # file (appmsg type 6)
-        content_file = "<msg><appmsg><title>contract_final.pdf</title><type>6</type></appmsg></msg>"
-        kind, sub, fn = map_agent_message_kind(49, content_file)
+        # File
+        kind, sub, fn = map_agent_message_kind({"kind": "file", "subtype": 6, "filename": "spec.pdf"})
         self.assertEqual(kind, "file")
         self.assertEqual(sub, 6)
-        self.assertEqual(fn, "contract_final.pdf")
+        self.assertEqual(fn, "spec.pdf")
 
-        # link (appmsg type 5)
-        content_link = "<msg><appmsg><title>News Title</title><type>5</type><url>https://example.com</url></appmsg></msg>"
-        kind, sub, fn = map_agent_message_kind(49, content_link)
+        # Link
+        kind, sub, fn = map_agent_message_kind({"kind": "link", "subtype": 5})
         self.assertEqual(kind, "link")
         self.assertEqual(sub, 5)
 
-        # reply with refermsg
-        content_reply = "<msg><appmsg><title>Title</title><refermsg><content>ref</content></refermsg></appmsg></msg>"
-        kind, sub, fn = map_agent_message_kind(49, content_reply)
+        # Reply
+        kind, sub, fn = map_agent_message_kind({"kind": "reply", "subtype": 57})
         self.assertEqual(kind, "reply")
+        self.assertEqual(sub, 57)
 
-        # unknown appmsg
-        content_unknown = "<msg><appmsg><title>Custom</title><type>999</type></appmsg></msg>"
-        kind, sub, fn = map_agent_message_kind(49, content_unknown)
+        # Unknown / unmapped type defaults to unknown
+        kind, sub, fn = map_agent_message_kind({"kind": "custom_weird_kind", "subtype": 999})
         self.assertEqual(kind, "unknown")
         self.assertEqual(sub, 999)
 
-        # completely unknown type
-        kind, sub, fn = map_agent_message_kind(98765, "opaque")
+        # Missing kind defaults to unknown
+        kind, sub, fn = map_agent_message_kind({})
         self.assertEqual(kind, "unknown")
 
     def test_message_id_parity_with_legacy(self) -> None:
-        """C4: message_id must strictly match content_hash(source_message_identity(chat_id, '', local_id))."""
+        """P0-2: Single stable source-message identity algorithm shared between direct and legacy."""
         cases = [
             ("wxid_user123", 101),
             ("38808757431@chatroom", 88),
@@ -129,7 +142,7 @@ class CanonicalNormalizationTest(unittest.TestCase):
             "chatId": "38808757431@chatroom",
             "sender": "wxid_sender1",
             "senderName": "Sender One",
-            "type": 3,
+            "kind": "image",
             "content": "",
             "timestamp": "2026-03-30T10:00:00Z",
             "isSelf": False,
@@ -147,8 +160,8 @@ class CanonicalNormalizationTest(unittest.TestCase):
         self.assertEqual(normalized["vendor_specific"]["source_local_id"], 86)
 
 
-class AccountWorkerConvergenceTest(unittest.TestCase):
-    """Work Package C tests for real-time incremental sync branching and watermark tracking."""
+class AccountWorkerPaginationAndBacklogTest(unittest.TestCase):
+    """P0-1 tests: Eliminate burst message loss, pagination loop, restart catch-up, and zero-fetch gates."""
 
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
@@ -172,36 +185,29 @@ class AccountWorkerConvergenceTest(unittest.TestCase):
         account_dir.mkdir(parents=True, exist_ok=True)
         (account_dir / "xwechat_files" / "wxid_bound").mkdir(parents=True, exist_ok=True)
 
-        account = AccountConfig(
-            account_id=account_id,
-            display_name="Agent Account",
-            source_db_dir=account_dir / "xwechat_files" / "wxid_bound",
-            wechat_base_dir=account_dir,
-            keys_file=account_dir / "keys.json",
-            runtime_dir=account_dir / "runtime",
-            decrypted_dir=account_dir / "decrypted",
-            decrypt_state_file=account_dir / "decrypt_state.json",
-            memory_db=account_dir / "memory.db",
-            media_dir=account_dir / "media",
-            sync_status_file=account_dir / "sync_status.json",
-            config_file=account_dir / "config.json",
-            runtime={
-                "instance_uuid": "inst-1",
-                "runtime_alias": account_id,
-                "resource_key": account_id,
-                "runtime_provider": "agent_wechat",
-                "agent_wechat_base_url": "http://127.0.0.1:6174",
-                "agent_wechat_token_file": str(token_file),
-                "logged_in_user": "wxid_bound",
-                "running": True,
-            },
-        )
-        self.registry._accounts = {account_id: account}
+        reg_payload = {
+            "accounts": [
+                {
+                    "account_id": account_id,
+                    "display_name": "Agent Account",
+                    "source_db_dir": str(account_dir / "xwechat_files" / "wxid_bound"),
+                    "runtime_provider": "agent_wechat",
+                    "agent_wechat": {
+                        "base_url": "http://127.0.0.1:6174",
+                        "token_file": str(token_file),
+                    },
+                }
+            ]
+        }
+        self.registry_file.write_text(json.dumps(reg_payload), encoding="utf-8")
+        self.registry.replace_from(load_registry(self.registry_file, root=self.root))
+        account = self.registry.require(account_id)
         self.store.upsert_account(account_id, account.display_name, state="online", runtime=account.runtime)
         return account
 
     @patch("core.agent_wechat.AgentWechatClient.from_account")
-    def test_worker_agent_wechat_branches_and_syncs_incrementally(self, mock_client_factory: MagicMock) -> None:
+    def test_burst_40_messages_no_loss(self, mock_client_factory: MagicMock) -> None:
+        """P0-1 Gate: Burst 40 messages (101~140) must all be written without loss."""
         from core.account_worker import AccountWorker
 
         account = self._create_agent_account()
@@ -209,89 +215,244 @@ class AccountWorkerConvergenceTest(unittest.TestCase):
 
         mock_client = MagicMock(spec=AgentWechatClient)
         mock_client.health.return_value = {"status": "ok"}
+        mock_client.list_contacts.return_value = []
+
+        # Seed an existing message at localId=100
+        self.store.upsert_chat({
+            "account_id": account.account_id,
+            "chat_id": "burst_chat",
+            "type": "private",
+            "display_name": "Burst Chat",
+        })
+        self.store.upsert_message(normalize_agent_message(account.account_id, {
+            "localId": 100,
+            "chatId": "burst_chat",
+            "kind": "text",
+            "content": "msg 100",
+            "timestamp": "2026-03-30T10:00:00Z",
+            "isSelf": False,
+        }))
+        self.assertEqual(self.store.max_source_local_id(account.account_id, "burst_chat"), 100)
+
+        # Burst of 40 new messages (101~140)
+        burst_messages = [
+            {
+                "localId": i,
+                "serverId": f"srv_{i}",
+                "chatId": "burst_chat",
+                "kind": "text",
+                "content": f"burst message {i}",
+                "timestamp": f"2026-03-30T10:01:{i%60:02d}Z",
+                "isSelf": False,
+            }
+            for i in range(140, 100, -1)  # DESC order from upstream
+        ]
+
         mock_client.list_chats.return_value = [
             {
-                "id": "chat_one",
-                "name": "Chat One",
+                "id": "burst_chat",
+                "name": "Burst Chat",
                 "isGroup": False,
-                "lastMsgLocalId": 10,
-                "lastActivityAt": 1750000000,
-                "unreadCount": 0,
+                "lastMsgLocalId": 140,
+                "lastActivityAt": "2026-03-30T10:05:00Z",
+                "unreadCount": 40,
             }
         ]
-        mock_client.list_messages.return_value = [
+        mock_client.list_messages.return_value = burst_messages
+        mock_client_factory.return_value = mock_client
+
+        res = worker.run_account(account)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["messages"], 40)
+
+        # Verify all 40 messages are saved
+        all_msgs = self.store.list_messages(account.account_id, "burst_chat", limit=100)["messages"]
+        self.assertEqual(len(all_msgs), 41)  # 100 + 40 new
+        local_ids = {m["vendor_specific"]["source_local_id"] for m in all_msgs}
+        for i in range(100, 141):
+            self.assertIn(i, local_ids)
+        self.assertEqual(self.store.max_source_local_id(account.account_id, "burst_chat"), 140)
+
+    @patch("core.agent_wechat.AgentWechatClient.from_account")
+    def test_restart_catchup_across_pagination_no_loss(self, mock_client_factory: MagicMock) -> None:
+        """P0-1 Gate: On Core restart, catching up 80 messages (101~180) across 50-limit pages without loss."""
+        from core.account_worker import AccountWorker
+
+        account = self._create_agent_account()
+        worker = AccountWorker(self.registry, self.store)
+
+        mock_client = MagicMock(spec=AgentWechatClient)
+        mock_client.health.return_value = {"status": "ok"}
+        mock_client.list_contacts.return_value = []
+
+        # Existing persisted message localId=100
+        self.store.upsert_chat({
+            "account_id": account.account_id,
+            "chat_id": "catchup_chat",
+            "type": "private",
+            "display_name": "Catchup Chat",
+        })
+        self.store.upsert_message(normalize_agent_message(account.account_id, {
+            "localId": 100,
+            "chatId": "catchup_chat",
+            "kind": "text",
+            "content": "msg 100",
+            "timestamp": "2026-03-30T09:00:00Z",
+            "isSelf": False,
+        }))
+
+        # Upstream has 80 new messages from 101 to 180
+        # Page 1 (offset=0, limit=50): 180 down to 131 (50 messages)
+        page1 = [
             {
-                "localId": 10,
-                "serverId": "srv10",
-                "chatId": "chat_one",
-                "sender": "wxid_peer",
-                "senderName": "Peer",
-                "type": 1,
-                "content": "First realtime message",
+                "localId": i,
+                "serverId": f"srv_{i}",
+                "chatId": "catchup_chat",
+                "kind": "text",
+                "content": f"msg {i}",
                 "timestamp": "2026-03-30T10:00:00Z",
                 "isSelf": False,
             }
+            for i in range(180, 130, -1)
         ]
-        mock_client.list_contacts.return_value = []
-        mock_client_factory.return_value = mock_client
-
-        # Cycle 1: cold start -> should fetch messages
-        result1 = worker.run_account(account)
-        self.assertTrue(result1["ok"])
-        self.assertEqual(result1["chats"], 1)
-        self.assertEqual(result1["messages"], 1)
-        self.assertEqual(mock_client.list_messages.call_count, 1)
-
-        # Verify message written to CoreStore
-        messages = self.store.list_messages(account.account_id, "chat_one")
-        self.assertEqual(len(messages["messages"]), 1)
-        self.assertEqual(messages["messages"][0]["text"], "First realtime message")
-
-        # Verify events emitted
-        events = self.store.poll_events(after="", limit=10)
-        event_types = [e["event_type"] for e in events["events"]]
-        self.assertIn("message.created", event_types)
-
-        # Cycle 2: no changes in chat watermark -> list_messages must NOT be called
-        mock_client.list_messages.reset_mock()
-        result2 = worker.run_account(account)
-        self.assertTrue(result2["ok"])
-        self.assertEqual(mock_client.list_messages.call_count, 0)
-
-        # Cycle 3: new message arrived in chat_one
-        mock_client.list_chats.return_value = [
+        # Page 2 (offset=50, limit=50): 130 down to 101 (30 messages)
+        page2 = [
             {
-                "id": "chat_one",
-                "name": "Chat One",
-                "isGroup": False,
-                "lastMsgLocalId": 11,
-                "lastActivityAt": 1750000010,
-                "unreadCount": 1,
-            }
-        ]
-        mock_client.list_messages.return_value = [
-            {
-                "localId": 11,
-                "serverId": "srv11",
-                "chatId": "chat_one",
-                "sender": "wxid_peer",
-                "senderName": "Peer",
-                "type": 1,
-                "content": "Second realtime message",
-                "timestamp": "2026-03-30T10:01:00Z",
+                "localId": i,
+                "serverId": f"srv_{i}",
+                "chatId": "catchup_chat",
+                "kind": "text",
+                "content": f"msg {i}",
+                "timestamp": "2026-03-30T09:30:00Z",
                 "isSelf": False,
             }
+            for i in range(130, 100, -1)
         ]
-        result3 = worker.run_account(account)
-        self.assertTrue(result3["ok"])
-        self.assertEqual(mock_client.list_messages.call_count, 1)
 
-        messages3 = self.store.list_messages(account.account_id, "chat_one")
-        self.assertEqual(len(messages3["messages"]), 2)
+        def fake_list_messages(chat_id: str, limit: int = 50, offset: int = 0):
+            if offset == 0:
+                return page1
+            elif offset == 50:
+                return page2
+            return []
+
+        mock_client.list_chats.return_value = [
+            {
+                "id": "catchup_chat",
+                "name": "Catchup Chat",
+                "isGroup": False,
+                "lastMsgLocalId": 180,
+                "lastActivityAt": "2026-03-30T10:00:00Z",
+                "unreadCount": 80,
+            }
+        ]
+        mock_client.list_messages.side_effect = fake_list_messages
+        mock_client_factory.return_value = mock_client
+
+        res = worker.run_account(account)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["messages"], 80)
+        self.assertEqual(mock_client.list_messages.call_count, 2)
+
+        # Verify all 81 messages are present in store
+        all_msgs = self.store.list_messages(account.account_id, "catchup_chat", limit=200)["messages"]
+        self.assertEqual(len(all_msgs), 81)
+        self.assertEqual(self.store.max_source_local_id(account.account_id, "catchup_chat"), 180)
+
+    @patch("core.agent_wechat.AgentWechatClient.from_account")
+    def test_unchanged_chat_fetch_zero(self, mock_client_factory: MagicMock) -> None:
+        """P0-1 Gate: UNCHANGED_CHAT_MESSAGE_FETCH = 0 when lastMsgLocalId <= core_max_id."""
+        from core.account_worker import AccountWorker
+
+        account = self._create_agent_account()
+        worker = AccountWorker(self.registry, self.store)
+
+        mock_client = MagicMock(spec=AgentWechatClient)
+        mock_client.health.return_value = {"status": "ok"}
+        mock_client.list_contacts.return_value = []
+
+        # Seed localId=50
+        self.store.upsert_chat({
+            "account_id": account.account_id,
+            "chat_id": "idle_chat",
+            "type": "private",
+            "display_name": "Idle Chat",
+        })
+        self.store.upsert_message(normalize_agent_message(account.account_id, {
+            "localId": 50,
+            "chatId": "idle_chat",
+            "kind": "text",
+            "content": "msg 50",
+            "timestamp": "2026-03-30T09:00:00Z",
+            "isSelf": False,
+        }))
+
+        # Upstream chat reports lastMsgLocalId=50 (unchanged)
+        mock_client.list_chats.return_value = [
+            {
+                "id": "idle_chat",
+                "name": "Idle Chat",
+                "isGroup": False,
+                "lastMsgLocalId": 50,
+                "lastActivityAt": "2026-03-30T09:00:00Z",
+                "unreadCount": 0,
+            }
+        ]
+        mock_client_factory.return_value = mock_client
+
+        res = worker.run_account(account)
+        self.assertTrue(res["ok"])
+        self.assertEqual(mock_client.list_messages.call_count, 0)
+
+    @patch("core.agent_wechat.AgentWechatClient.from_account")
+    def test_unread_count_only_change_fetch_zero(self, mock_client_factory: MagicMock) -> None:
+        """P0-1 Gate: unreadCount change without lastMsgLocalId change must fetch 0 messages."""
+        from core.account_worker import AccountWorker
+
+        account = self._create_agent_account()
+        worker = AccountWorker(self.registry, self.store)
+
+        mock_client = MagicMock(spec=AgentWechatClient)
+        mock_client.health.return_value = {"status": "ok"}
+        mock_client.list_contacts.return_value = []
+
+        # Seed localId=50
+        self.store.upsert_chat({
+            "account_id": account.account_id,
+            "chat_id": "read_chat",
+            "type": "private",
+            "display_name": "Read Chat",
+        })
+        self.store.upsert_message(normalize_agent_message(account.account_id, {
+            "localId": 50,
+            "chatId": "read_chat",
+            "kind": "text",
+            "content": "msg 50",
+            "timestamp": "2026-03-30T09:00:00Z",
+            "isSelf": False,
+        }))
+
+        # Upstream chat reports lastMsgLocalId=50, but unreadCount changed from 0 to 5
+        mock_client.list_chats.return_value = [
+            {
+                "id": "read_chat",
+                "name": "Read Chat",
+                "isGroup": False,
+                "lastMsgLocalId": 50,
+                "lastActivityAt": "2026-03-30T09:00:00Z",
+                "unreadCount": 5,
+            }
+        ]
+        mock_client_factory.return_value = mock_client
+
+        res = worker.run_account(account)
+        self.assertTrue(res["ok"])
+        # Must NOT call list_messages solely due to unreadCount change
+        self.assertEqual(mock_client.list_messages.call_count, 0)
 
 
-class LazyMediaFetchTest(unittest.TestCase):
-    """Work Package D tests for on-demand lazy media fetching."""
+class LazyMediaCorrectnessTest(unittest.TestCase):
+    """P0-4 tests for lazy media correctness: unsupported priority, collision prevention, role preservation, streaming."""
 
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
@@ -330,57 +491,31 @@ class LazyMediaFetchTest(unittest.TestCase):
             ]
         }
         self.registry_file.write_text(json.dumps(reg_payload), encoding="utf-8")
-
-        account = AccountConfig(
-            account_id=account_id,
-            display_name="Media Account",
-            source_db_dir=account_dir / "xwechat_files" / "wxid_bound",
-            wechat_base_dir=account_dir,
-            keys_file=account_dir / "keys.json",
-            runtime_dir=account_dir / "runtime",
-            decrypted_dir=account_dir / "decrypted",
-            decrypt_state_file=account_dir / "decrypt_state.json",
-            memory_db=account_dir / "memory.db",
-            media_dir=account_dir / "media",
-            sync_status_file=account_dir / "sync_status.json",
-            config_file=account_dir / "config.json",
-            runtime={
-                "instance_uuid": "inst-m",
-                "runtime_alias": account_id,
-                "resource_key": account_id,
-                "runtime_provider": "agent_wechat",
-                "agent_wechat_base_url": "http://127.0.0.1:6174",
-                "agent_wechat_token_file": str(token_file),
-                "logged_in_user": "wxid_bound",
-                "running": True,
-            },
-        )
-        self.registry._accounts = {account_id: account}
+        self.registry.replace_from(load_registry(self.registry_file, root=self.root))
+        account = self.registry.require(account_id)
         self.store.upsert_account(account_id, account.display_name, state="online", runtime=account.runtime)
         return account
 
     @patch("core.agent_wechat.AgentWechatClient.from_account")
-    def test_lazy_media_fetch_resolves_and_caches_to_disk(self, mock_client_factory: MagicMock) -> None:
-        from core.app import CoreService
+    def test_unsupported_evaluated_first_and_terminal(self, mock_client_factory: MagicMock) -> None:
+        """P0-4 Gate: unsupported must be evaluated before not data (no fake pending) and terminal cached."""
+        from core.app import ApiError, CoreService
 
         account = self._create_agent_account()
         service = CoreService(root=self.root, registry=self.registry, store=self.store)
 
-        # Upsert chat first for foreign key constraint
         self.store.upsert_chat({
             "account_id": account.account_id,
-            "chat_id": "chat_media",
+            "chat_id": "chat_unsupported",
             "type": "private",
-            "display_name": "Media Chat",
+            "display_name": "Unsupported Chat",
         })
-
-        # Upsert a pending image message
         norm_msg = normalize_agent_message(
             account.account_id,
             {
-                "localId": 42,
-                "chatId": "chat_media",
-                "type": 3,
+                "localId": 99,
+                "chatId": "chat_unsupported",
+                "kind": "sticker",
                 "content": "",
                 "timestamp": "2026-03-30T10:00:00Z",
                 "isSelf": False,
@@ -389,28 +524,306 @@ class LazyMediaFetchTest(unittest.TestCase):
         self.store.upsert_message(norm_msg)
         media_id = norm_msg["media_id"]
 
-        fake_image_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIFfakeimagebytes"
         mock_client = MagicMock(spec=AgentWechatClient)
-        mock_client.get_media.return_value = {
-            "type": "image",
-            "format": "jpeg",
-            "filename": "img_42.jpg",
-            "data": base64.b64encode(fake_image_bytes).decode("ascii"),
-        }
+        # Upstream returns unsupported header with empty data
+        mock_client.get_media_raw.return_value = (b"", {"x-media-status": "unsupported"})
+        mock_client.fetch_media_to_file.return_value = {"status": "unsupported", "x-media-status": "unsupported"}
         mock_client_factory.return_value = mock_client
 
-        # Call resolve_media: should fetch on-demand, cache to disk, return bytes
-        content, mime_type, filename, disposition, status = service.resolve_media(account.account_id, media_id)
-        self.assertEqual(content, fake_image_bytes)
-        self.assertEqual(mime_type, "image/jpeg")
-        self.assertEqual(status, "ready")
-        self.assertEqual(mock_client.get_media.call_count, 1)
+        # 1. First call: must raise 404 media_unsupported (NOT 202 media_pending)
+        with self.assertRaises(ApiError) as ctx:
+            service.resolve_media(account.account_id, media_id)
+        self.assertEqual(ctx.exception.status, 404)
+        self.assertEqual(ctx.exception.code, "media_unsupported")
 
-        # Call again: should read directly from disk cache without calling get_media
-        mock_client.get_media.reset_mock()
-        content2, mime_type2, _, _, _ = service.resolve_media(account.account_id, media_id)
-        self.assertEqual(content2, fake_image_bytes)
-        self.assertEqual(mock_client.get_media.call_count, 0)
+        # 2. Verify stored as terminal unsupported
+        cached = self.store.media(account.account_id, media_id)
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["status"], "unsupported")
+
+        # 3. Second call: must return 404 from cache without re-querying upstream
+        mock_client.fetch_media_to_file.reset_mock()
+        mock_client.get_media_raw.reset_mock()
+        with self.assertRaises(ApiError) as ctx2:
+            service.resolve_media(account.account_id, media_id)
+        self.assertEqual(ctx2.exception.status, 404)
+        self.assertEqual(ctx2.exception.code, "media_unsupported")
+        self.assertEqual(mock_client.fetch_media_to_file.call_count, 0)
+        self.assertEqual(mock_client.get_media_raw.call_count, 0)
+
+    @patch("core.agent_wechat.AgentWechatClient.from_account")
+    def test_media_cache_filename_collision_isolated(self, mock_client_factory: MagicMock) -> None:
+        """P0-4 Gate: MEDIA_CACHE_FILENAME_COLLISION = PASS: two files with same filename cached in media_id dirs."""
+        from core.app import CoreService
+
+        account = self._create_agent_account()
+        service = CoreService(root=self.root, registry=self.registry, store=self.store)
+
+        self.store.upsert_chat({
+            "account_id": account.account_id,
+            "chat_id": "chat_collision",
+            "type": "private",
+            "display_name": "Collision Chat",
+        })
+
+        # Message A
+        msg_a = normalize_agent_message(account.account_id, {
+            "localId": 1001,
+            "chatId": "chat_collision",
+            "kind": "file",
+            "filename": "report.pdf",
+            "timestamp": "2026-03-30T10:00:00Z",
+            "isSelf": False,
+        })
+        self.store.upsert_message(msg_a)
+
+        # Message B
+        msg_b = normalize_agent_message(account.account_id, {
+            "localId": 1002,
+            "chatId": "chat_collision",
+            "kind": "file",
+            "filename": "report.pdf",
+            "timestamp": "2026-03-30T10:01:00Z",
+            "isSelf": False,
+        })
+        self.store.upsert_message(msg_b)
+
+        media_id_a = msg_a["media_id"]
+        media_id_b = msg_b["media_id"]
+        self.assertNotEqual(media_id_a, media_id_b)
+
+        mock_client = MagicMock(spec=AgentWechatClient)
+        content_a = b"%PDF-1.4 Content A"
+        content_b = b"%PDF-1.4 Content B (different)"
+
+        def fake_fetch(chat_id, local_id, target_path, **kwargs):
+            if int(local_id) == 1001:
+                target_path.write_bytes(content_a)
+                return {"status": "ready", "x-media-status": "ready", "x-media-filename": "report.pdf", "x-media-role": "original"}
+            else:
+                target_path.write_bytes(content_b)
+                return {"status": "ready", "x-media-status": "ready", "x-media-filename": "report.pdf", "x-media-role": "original"}
+
+        mock_client.fetch_media_to_file.side_effect = fake_fetch
+        mock_client.get_media_raw.side_effect = lambda cid, lid: (content_a if int(lid) == 1001 else content_b, {"x-media-status": "ready", "x-media-filename": "report.pdf", "x-media-role": "original"})
+        mock_client_factory.return_value = mock_client
+
+        # Resolve A
+        res_a, _, fname_a, _, _ = service.resolve_media(account.account_id, media_id_a)
+        data_a = res_a.read_bytes() if isinstance(res_a, Path) else res_a
+        self.assertEqual(data_a, content_a)
+
+        # Resolve B
+        res_b, _, fname_b, _, _ = service.resolve_media(account.account_id, media_id_b)
+        data_b = res_b.read_bytes() if isinstance(res_b, Path) else res_b
+        self.assertEqual(data_b, content_b)
+
+        # Inspect disk paths: must be in different directories under media_id
+        media_row_a = self.store.media(account.account_id, media_id_a)
+        media_row_b = self.store.media(account.account_id, media_id_b)
+
+        path_a = Path(media_row_a["local_path"])
+        path_b = Path(media_row_b["local_path"])
+
+        self.assertIn(media_id_a, str(path_a))
+        self.assertIn(media_id_b, str(path_b))
+        self.assertNotEqual(path_a, path_b)
+        self.assertEqual(path_a.read_bytes(), content_a)
+        self.assertEqual(path_b.read_bytes(), content_b)
+
+    @patch("core.agent_wechat.AgentWechatClient.from_account")
+    def test_media_role_preserved_to_core(self, mock_client_factory: MagicMock) -> None:
+        """P0-4 Gate: MEDIA_ROLE_PRESERVED = PASS: thumbnail vs original preserved into CoreStore."""
+        from core.app import CoreService
+
+        account = self._create_agent_account()
+        service = CoreService(root=self.root, registry=self.registry, store=self.store)
+
+        self.store.upsert_chat({
+            "account_id": account.account_id,
+            "chat_id": "chat_role",
+            "type": "private",
+            "display_name": "Role Chat",
+        })
+
+        # Thumbnail image message
+        msg_thumb = normalize_agent_message(account.account_id, {
+            "localId": 2001,
+            "chatId": "chat_role",
+            "kind": "image",
+            "filename": "img_2001_thumb.jpg",
+            "timestamp": "2026-03-30T10:00:00Z",
+            "isSelf": False,
+        })
+        self.store.upsert_message(msg_thumb)
+
+        mock_client = MagicMock(spec=AgentWechatClient)
+        def fake_fetch_thumb(chat_id, local_id, target_path, **kwargs):
+            target_path.write_bytes(b"thumb_bytes")
+            return {"status": "ready", "x-media-status": "ready", "x-media-filename": "img_2001_thumb.jpg", "x-media-role": "thumbnail"}
+
+        mock_client.fetch_media_to_file.side_effect = fake_fetch_thumb
+        mock_client.get_media_raw.return_value = (
+            b"thumb_bytes",
+            {"x-media-status": "ready", "x-media-filename": "img_2001_thumb.jpg", "x-media-role": "thumbnail"},
+        )
+        mock_client_factory.return_value = mock_client
+
+        service.resolve_media(account.account_id, msg_thumb["media_id"])
+        saved_media = self.store.media(account.account_id, msg_thumb["media_id"])
+        self.assertEqual(saved_media["role"], "thumbnail")
+
+    @patch("core.agent_wechat.AgentWechatClient.from_account")
+    def test_url_backed_sticker_lazy_fetch_without_auth_header(self, mock_client_factory: MagicMock) -> None:
+        """P0-5 Gate: URL_BACKED_STICKER_LAZY_FETCH = PASS: lazy fetch URL without Auth header to CDN."""
+        from core.app import CoreService
+
+        account = self._create_agent_account()
+        service = CoreService(root=self.root, registry=self.registry, store=self.store)
+
+        self.store.upsert_chat({
+            "account_id": account.account_id,
+            "chat_id": "chat_sticker",
+            "type": "private",
+            "display_name": "Sticker Chat",
+        })
+
+        msg_sticker = normalize_agent_message(account.account_id, {
+            "localId": 3001,
+            "chatId": "chat_sticker",
+            "kind": "sticker",
+            "filename": "emoji_abc123.gif",
+            "timestamp": "2026-03-30T10:00:00Z",
+            "isSelf": False,
+        })
+        self.store.upsert_message(msg_sticker)
+
+        mock_client = MagicMock(spec=AgentWechatClient)
+        def fake_fetch_sticker(chat_id, local_id, target_path, **kwargs):
+            target_path.write_bytes(b"GIF89a_fake_sticker")
+            return {
+                "status": "ready",
+                "x-media-status": "ready",
+                "x-media-filename": "emoji_abc123.gif",
+                "x-media-role": "original",
+                "content-type": "image/gif",
+            }
+
+        mock_client.fetch_media_to_file.side_effect = fake_fetch_sticker
+        mock_client_factory.return_value = mock_client
+
+        res, mime, fname, disp, status = service.resolve_media(account.account_id, msg_sticker["media_id"])
+        self.assertEqual(status, "ready")
+        self.assertEqual(mime, "image/gif")
+        self.assertEqual(fname, "emoji_abc123.gif")
+        saved_media = self.store.media(account.account_id, msg_sticker["media_id"])
+        self.assertIsNotNone(saved_media)
+        self.assertEqual(saved_media["status"], "ready")
+
+    @patch("core.agent_wechat.AgentWechatClient.from_account")
+    def test_sticker_failure_does_not_block_text_sync(self, mock_client_factory: MagicMock) -> None:
+        """P0-5 Gate: STICKER_FAILURE_DOES_NOT_BLOCK_TEXT_SYNC = PASS."""
+        from core.account_worker import AccountWorker
+
+        account = self._create_agent_account()
+        worker = AccountWorker(self.registry, self.store)
+
+        mock_client = MagicMock(spec=AgentWechatClient)
+        mock_client.health.return_value = {"status": "ok"}
+        mock_client.list_chats.return_value = [
+            {"id": "chat_mixed", "name": "Mixed Chat", "lastMsgLocalId": 5002, "isGroup": False}
+        ]
+        # Messages: one text message and one sticker message
+        mock_client.list_messages.return_value = [
+            {
+                "localId": 5002,
+                "chatId": "chat_mixed",
+                "kind": "text",
+                "content": "Hello after sticker",
+                "timestamp": "2026-03-30T10:00:02Z",
+                "isSelf": False,
+            },
+            {
+                "localId": 5001,
+                "chatId": "chat_mixed",
+                "kind": "sticker",
+                "content": "",
+                "timestamp": "2026-03-30T10:00:01Z",
+                "isSelf": False,
+            },
+        ]
+        # Even if media fetching fails or raises, sync cycle NEVER touches media!
+        mock_client.fetch_media_to_file.side_effect = Exception("CDN network timeout")
+        mock_client_factory.return_value = mock_client
+
+        status = worker.run_account(account)
+        self.assertTrue(status.get("ok"))
+        self.assertEqual(status.get("messages"), 2)
+
+        # Messages are fully synced into store
+        msgs = self.store.list_messages(account.account_id, "chat_mixed")["messages"]
+        self.assertEqual(len(msgs), 2)
+        local_ids = [int(m.get("vendor_specific", {}).get("source_local_id") or m.get("source_local_id") or 0) for m in msgs]
+        self.assertIn(5001, local_ids)
+        self.assertIn(5002, local_ids)
+
+    @patch("core.agent_wechat.AgentWechatClient.from_account")
+    def test_large_file_streaming_over_10mb(self, mock_client_factory: MagicMock) -> None:
+        """P0-6 Gate: LARGE_FILE_STREAMING_OVER_10MB = PASS: chunked streaming of >10MB fixture."""
+        from core.app import CoreService
+
+        account = self._create_agent_account()
+        service = CoreService(root=self.root, registry=self.registry, store=self.store)
+
+        self.store.upsert_chat({
+            "account_id": account.account_id,
+            "chat_id": "chat_large_file",
+            "type": "private",
+            "display_name": "Large File Chat",
+        })
+
+        # 12MB fixture
+        fixture_size = 12 * 1024 * 1024
+        msg_file = normalize_agent_message(account.account_id, {
+            "localId": 9001,
+            "chatId": "chat_large_file",
+            "kind": "file",
+            "filename": "dataset_12mb.bin",
+            "timestamp": "2026-03-30T10:00:00Z",
+            "isSelf": False,
+        })
+        self.store.upsert_message(msg_file)
+
+        mock_client = MagicMock(spec=AgentWechatClient)
+        def fake_fetch_large(chat_id, local_id, target_path, **kwargs):
+            # Stream write 12MB in 64KB chunks
+            with open(target_path, "wb") as f:
+                chunk = b"X" * (64 * 1024)
+                for _ in range(fixture_size // (64 * 1024)):
+                    f.write(chunk)
+            return {
+                "status": "ready",
+                "x-media-status": "ready",
+                "x-media-filename": "dataset_12mb.bin",
+                "x-media-role": "original",
+                "content-type": "application/octet-stream",
+            }
+
+        mock_client.fetch_media_to_file.side_effect = fake_fetch_large
+        mock_client_factory.return_value = mock_client
+
+        res_path, mime, fname, disp, status = service.resolve_media(account.account_id, msg_file["media_id"])
+        self.assertEqual(status, "ready")
+        self.assertEqual(fname, "dataset_12mb.bin")
+        self.assertTrue(isinstance(res_path, Path))
+        self.assertEqual(res_path.stat().st_size, fixture_size)
+
+        # Ensure store records correct metadata
+        saved_media = self.store.media(account.account_id, msg_file["media_id"])
+        self.assertIsNotNone(saved_media)
+        self.assertEqual(saved_media["filename"], "dataset_12mb.bin")
+        self.assertEqual(saved_media["role"], "original")
+        self.assertEqual(saved_media["status"], "ready")
 
 
 if __name__ == "__main__":

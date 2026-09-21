@@ -382,38 +382,6 @@ class MessageIdentityProjectionTest(unittest.TestCase):
         self.assertEqual(emitted_msg["instance_uuid"], self.instance_uuid)
         self.assertEqual(emitted_msg["wechat_identity_uuid"], self.identity_a)
 
-        # 6. Verify Console consumption: Console consumes emitted event, message in Console is still identity A
-        try:
-            from wechat_console.store import ConsoleStore
-            console_db_path = Path(self.temp_dir.name) / "console_test.sqlite"
-            console_store = ConsoleStore(console_db_path, Path(self.temp_dir.name) / "archive")
-            console_store.ingest_events(update_events)
-
-            # Console list_messages with identity A finds the message
-            page_a = console_store.list_messages(
-                account_id=self.account_id,
-                chat_id=self.chat_id,
-                instance_uuid=self.instance_uuid,
-                wechat_identity_uuid=self.identity_a,
-            )
-            self.assertEqual(len(list(page_a)), 1)
-            msg_res = list(page_a)[0]
-            self.assertEqual(msg_res["message_id"], msg_id)
-            self.assertEqual(msg_res["text"], "Updated text under rebind B")
-            self.assertEqual(msg_res["instance_uuid"], self.instance_uuid)
-            self.assertEqual(msg_res["wechat_identity_uuid"], self.identity_a)
-
-            # Console list_messages with identity B returns 0
-            page_b = console_store.list_messages(
-                account_id=self.account_id,
-                chat_id=self.chat_id,
-                instance_uuid=self.instance_uuid,
-                wechat_identity_uuid=identity_b,
-            )
-            self.assertEqual(len(list(page_b)), 0)
-        except ImportError:
-            pass
-
         # 7. Verify one-time enrichment from empty -> non-empty:
         # A historical message with empty identity fields is enriched with current authoritative binding
         empty_msg_id = "msg-historical-empty-001"

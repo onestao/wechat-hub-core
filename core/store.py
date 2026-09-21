@@ -1078,47 +1078,59 @@ class CoreStore:
             next_cursor = base64.urlsafe_b64encode(str(offset + len(rows)).encode("ascii")).decode("ascii").rstrip("=")
         return {"account_id": account_id, "chats": [self._chat_row(row) for row in rows], "next_cursor": next_cursor}
 
-    def upsert_chat(self, chat: dict[str, Any]) -> bool:
-        account_id = str(chat["account_id"])
-        chat_id = str(chat["chat_id"])
+    def upsert_chats(self, chats: list[dict[str, Any]]) -> list[bool]:
+        if not chats:
+            return []
+        results: list[bool] = []
         with self.connection() as conn:
-            gate = identity.sync_gate(conn, account_id)
-            instance_uuid = str(gate["instance"]["instance_uuid"])
-            identity_uuid = str(gate["stamp_identity"])
-            normalized = {
-                "account_id": account_id,
-                "chat_id": chat_id,
-                "type": str(chat.get("type") or "private"),
-                "display_name": str(chat.get("display_name") or chat_id),
-                "alias": str(chat.get("alias") or ""),
-                "member_count": max(0, int(chat.get("member_count") or 0)),
-                "updated_at": str(chat.get("updated_at") or utc_now()),
-                "vendor_specific": chat.get("vendor_specific") if isinstance(chat.get("vendor_specific"), dict) else {},
-            }
-            value_digest = digest(
-                {key: value for key, value in normalized.items() if key != "updated_at"}
-            )
-            before = conn.execute("SELECT digest FROM chats WHERE account_id=? AND chat_id=?", (account_id, chat_id)).fetchone()
-            conn.execute(
-                """
-                INSERT INTO chats (account_id, chat_id, instance_uuid, wechat_identity_uuid, type, display_name, alias, member_count, updated_at, vendor_json, digest)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(account_id, chat_id) DO UPDATE SET
-                    type=excluded.type, display_name=excluded.display_name, alias=excluded.alias,
-                    member_count=excluded.member_count, updated_at=excluded.updated_at,
-                    vendor_json=excluded.vendor_json, digest=excluded.digest,
-                    instance_uuid=CASE WHEN chats.instance_uuid<>'' THEN chats.instance_uuid ELSE excluded.instance_uuid END,
-                    wechat_identity_uuid=CASE WHEN chats.wechat_identity_uuid<>'' THEN chats.wechat_identity_uuid ELSE excluded.wechat_identity_uuid END
-                """,
-                (
-                    account_id, chat_id, instance_uuid, identity_uuid, normalized["type"], normalized["display_name"], normalized["alias"],
-                    normalized["member_count"], normalized["updated_at"], compact_json(normalized["vendor_specific"]), value_digest,
-                ),
-            )
-            changed = before is None or before["digest"] != value_digest
-            if changed:
-                self._append_event(conn, account_id, "chat.updated", {"chat": self._chat_row_from_value(normalized)})
-        return changed
+            gates: dict[str, Any] = {}
+            for chat in chats:
+                account_id = str(chat["account_id"])
+                if account_id not in gates:
+                    gates[account_id] = identity.sync_gate(conn, account_id)
+                gate = gates[account_id]
+                instance_uuid = str(gate["instance"]["instance_uuid"])
+                identity_uuid = str(gate["stamp_identity"])
+                chat_id = str(chat["chat_id"])
+                normalized = {
+                    "account_id": account_id,
+                    "chat_id": chat_id,
+                    "type": str(chat.get("type") or "private"),
+                    "display_name": str(chat.get("display_name") or chat_id),
+                    "alias": str(chat.get("alias") or ""),
+                    "member_count": max(0, int(chat.get("member_count") or 0)),
+                    "updated_at": str(chat.get("updated_at") or utc_now()),
+                    "vendor_specific": chat.get("vendor_specific") if isinstance(chat.get("vendor_specific"), dict) else {},
+                }
+                value_digest = digest(
+                    {key: value for key, value in normalized.items() if key != "updated_at"}
+                )
+                before = conn.execute("SELECT digest FROM chats WHERE account_id=? AND chat_id=?", (account_id, chat_id)).fetchone()
+                conn.execute(
+                    """
+                    INSERT INTO chats (account_id, chat_id, instance_uuid, wechat_identity_uuid, type, display_name, alias, member_count, updated_at, vendor_json, digest)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(account_id, chat_id) DO UPDATE SET
+                        type=excluded.type, display_name=excluded.display_name, alias=excluded.alias,
+                        member_count=excluded.member_count, updated_at=excluded.updated_at,
+                        vendor_json=excluded.vendor_json, digest=excluded.digest,
+                        instance_uuid=CASE WHEN chats.instance_uuid<>'' THEN chats.instance_uuid ELSE excluded.instance_uuid END,
+                        wechat_identity_uuid=CASE WHEN chats.wechat_identity_uuid<>'' THEN chats.wechat_identity_uuid ELSE excluded.wechat_identity_uuid END
+                    """,
+                    (
+                        account_id, chat_id, instance_uuid, identity_uuid, normalized["type"], normalized["display_name"], normalized["alias"],
+                        normalized["member_count"], normalized["updated_at"], compact_json(normalized["vendor_specific"]), value_digest,
+                    ),
+                )
+                changed = before is None or before["digest"] != value_digest
+                if changed:
+                    self._append_event(conn, account_id, "chat.updated", {"chat": self._chat_row_from_value(normalized)})
+                results.append(changed)
+        return results
+
+    def upsert_chat(self, chat: dict[str, Any]) -> bool:
+        res = self.upsert_chats([chat])
+        return res[0] if res else False
 
     @staticmethod
     def _chat_row_from_value(value: dict[str, Any]) -> dict[str, Any]:
@@ -1131,35 +1143,16 @@ class CoreStore:
             output["vendor_specific"] = value["vendor_specific"]
         return output
 
-    def upsert_contact(self, account_id: str, contact: dict[str, Any]) -> None:
-        member_id = str(contact.get("member_id") or "").strip()
-        if not member_id:
-            return
-        remark = str(contact.get("remark") or "").strip()
-        nickname = str(contact.get("nickname") or contact.get("nick_name") or "").strip()
-        alias = str(contact.get("alias") or "").strip()
-        avatar_ref = str(contact.get("avatar_ref") or contact.get("avatar_url") or "").strip()
-        head_img_md5 = str(contact.get("head_img_md5") or "").strip()
-        big_head_url = str(contact.get("big_head_url") or "").strip()
-        small_head_url = str(contact.get("small_head_url") or "").strip()
-        display_name = str(
-            contact.get("display_name")
-            or resolve_contact_display_name(remark=remark, nickname=nickname, alias=alias, member_id=member_id)
-        )
-        value = {
-            "display_name": display_name,
-            "alias": alias,
-            "remark": remark,
-            "nickname": nickname,
-            "avatar_ref": avatar_ref,
-            "head_img_md5": head_img_md5,
-            "big_head_url": big_head_url,
-            "small_head_url": small_head_url,
-        }
+    def upsert_contacts(self, account_id: str, contacts: list[dict[str, Any]]) -> int:
+        if not contacts:
+            return 0
+        now_ts = utc_now()
+        count = 0
         with self.connection() as conn:
             gate = identity.sync_gate(conn, account_id)
-            conn.execute(
-                """
+            instance_uuid = str(gate["instance"]["instance_uuid"])
+            identity_uuid = str(gate["stamp_identity"])
+            sql = """
                 INSERT INTO contacts (
                     account_id, member_id, instance_uuid, wechat_identity_uuid,
                     display_name, alias, remark, nickname, avatar_ref, head_img_md5,
@@ -1178,14 +1171,46 @@ class CoreStore:
                     digest=excluded.digest,
                     instance_uuid=CASE WHEN contacts.instance_uuid<>'' THEN contacts.instance_uuid ELSE excluded.instance_uuid END,
                     wechat_identity_uuid=CASE WHEN contacts.wechat_identity_uuid<>'' THEN contacts.wechat_identity_uuid ELSE excluded.wechat_identity_uuid END
-                """,
-                (
-                    account_id, member_id, str(gate["instance"]["instance_uuid"]), str(gate["stamp_identity"]),
-                    value["display_name"], value["alias"], value["remark"], value["nickname"],
-                    value["avatar_ref"], value["head_img_md5"], value["big_head_url"], value["small_head_url"],
-                    utc_now(), digest(value),
-                ),
-            )
+            """
+            for contact in contacts:
+                member_id = str(contact.get("member_id") or "").strip()
+                if not member_id:
+                    continue
+                remark = str(contact.get("remark") or "").strip()
+                nickname = str(contact.get("nickname") or contact.get("nick_name") or "").strip()
+                alias = str(contact.get("alias") or "").strip()
+                avatar_ref = str(contact.get("avatar_ref") or contact.get("avatar_url") or "").strip()
+                head_img_md5 = str(contact.get("head_img_md5") or "").strip()
+                big_head_url = str(contact.get("big_head_url") or "").strip()
+                small_head_url = str(contact.get("small_head_url") or "").strip()
+                display_name = str(
+                    contact.get("display_name")
+                    or resolve_contact_display_name(remark=remark, nickname=nickname, alias=alias, member_id=member_id)
+                )
+                value = {
+                    "display_name": display_name,
+                    "alias": alias,
+                    "remark": remark,
+                    "nickname": nickname,
+                    "avatar_ref": avatar_ref,
+                    "head_img_md5": head_img_md5,
+                    "big_head_url": big_head_url,
+                    "small_head_url": small_head_url,
+                }
+                conn.execute(
+                    sql,
+                    (
+                        account_id, member_id, instance_uuid, identity_uuid,
+                        value["display_name"], value["alias"], value["remark"], value["nickname"],
+                        value["avatar_ref"], value["head_img_md5"], value["big_head_url"], value["small_head_url"],
+                        now_ts, digest(value),
+                    ),
+                )
+                count += 1
+        return count
+
+    def upsert_contact(self, account_id: str, contact: dict[str, Any]) -> None:
+        self.upsert_contacts(account_id, [contact])
 
     def upsert_member(self, account_id: str, chat_id: str, member: dict[str, Any]) -> None:
         member_id = str(member.get("member_id") or "").strip()
@@ -1569,6 +1594,33 @@ class CoreStore:
                 (account_id, media_id, media_id),
             ).fetchone()
         return self._message_row(row) if row else None
+
+    def source_local_id_watermarks(self, account_id: str) -> dict[str, int]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT chat_id, MAX(CAST(source_local_id AS INTEGER)) AS max_id
+                FROM messages
+                WHERE account_id = ? AND source_local_id <> ''
+                GROUP BY chat_id
+                """,
+                (account_id,),
+            ).fetchall()
+        return {str(row["chat_id"]): int(row["max_id"]) for row in rows if row["max_id"] is not None}
+
+    def max_source_local_id(self, account_id: str, chat_id: str) -> int:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT CAST(source_local_id AS INTEGER) AS max_id
+                FROM messages
+                WHERE account_id = ? AND chat_id = ? AND source_local_id != ''
+                ORDER BY CAST(source_local_id AS INTEGER) DESC
+                LIMIT 1
+                """,
+                (account_id, chat_id),
+            ).fetchone()
+        return int(row["max_id"]) if row and row["max_id"] is not None else 0
 
     # ------------------------------------------------------------------
     # Identity-keyed data access (contract B8) — every business entity is

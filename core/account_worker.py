@@ -177,9 +177,8 @@ class AccountWorker:
     def __init__(self, registry: AccountRegistry, store: CoreStore) -> None:
         self.registry = registry
         self.store = store
-        self._chat_watermarks: dict[tuple[str, str], dict[str, Any]] = {}
         self._account_initialized: set[str] = set()
-        self._contact_cycle_count: dict[str, int] = {}
+        self._last_contact_refresh: dict[str, float] = {}
 
     def _assert_source_provenance(self, account: AccountConfig) -> None:
         """Fail closed when the selected source directory belongs to another wxid.
@@ -596,6 +595,8 @@ class AccountWorker:
                 self._account_initialized.add(account.account_id)
 
             chats = client.list_chats()
+            chat_dicts = []
+            parsed_chats = []
             for chat in chats:
                 chat_id = str(chat.get("id") or chat.get("username") or "").strip()
                 if not chat_id:
@@ -623,52 +624,59 @@ class AccountWorker:
                         "last_msg_local_id": last_msg_local_id,
                     },
                 }
-                self.store.upsert_chat(chat_dict)
-                chats_synced += 1
+                chat_dicts.append(chat_dict)
+                parsed_chats.append((chat_id, last_msg_local_id))
 
-                wm = self._chat_watermarks.get((account.account_id, chat_id))
-                has_changed = (
-                    wm is None
-                    or cold_start
-                    or last_msg_local_id > wm.get("last_msg_local_id", 0)
-                    or last_activity_raw != wm.get("last_activity_raw", "")
-                    or unread_count != wm.get("unread_count", 0)
-                )
+            # Batch upsert all chats in one transaction and one identity gate
+            if chat_dicts:
+                self.store.upsert_chats(chat_dicts)
+                chats_synced = len(chat_dicts)
 
-                if not has_changed:
+            # Query watermarks once per cycle for all chats of this account
+            watermarks = self.store.source_local_id_watermarks(account.account_id)
+
+            for chat_id, last_msg_local_id in parsed_chats:
+                core_max_id = watermarks.get(chat_id, 0)
+                if last_msg_local_id <= core_max_id:
                     continue
 
-                # Changed: fetch recent messages (incremental)
-                limit = 50 if cold_start else 30
-                raw_messages = client.list_messages(chat_id, limit=limit)
-                max_seen_local_id = last_msg_local_id
+                # Upstream has newer messages: paginate from offset=0
+                page_limit = 50
+                offset = 0
+                while True:
+                    raw_messages = client.list_messages(chat_id, limit=page_limit, offset=offset)
+                    if not raw_messages:
+                        break
 
-                for raw_msg in raw_messages:
-                    local_id = int(raw_msg.get("localId") or 0)
-                    if local_id > max_seen_local_id:
-                        max_seen_local_id = local_id
-                    norm = normalize_agent_message(account.account_id, raw_msg, bound_wxid=bound_wxid)
-                    res = self.store.upsert_message(norm)
-                    messages_synced += 1
-                    if res != "unchanged":
-                        message_changes += 1
+                    reached_existing = False
+                    for raw_msg in raw_messages:
+                        local_id = int(raw_msg.get("localId") or 0)
+                        if local_id <= core_max_id:
+                            reached_existing = True
+                        norm = normalize_agent_message(account.account_id, raw_msg, bound_wxid=bound_wxid)
+                        res = self.store.upsert_message(norm)
+                        messages_synced += 1
+                        if res != "unchanged":
+                            message_changes += 1
+                        if local_id > watermarks.get(chat_id, 0):
+                            watermarks[chat_id] = local_id
 
-                self._chat_watermarks[(account.account_id, chat_id)] = {
-                    "last_msg_local_id": max_seen_local_id,
-                    "last_activity_raw": last_activity_raw,
-                    "unread_count": unread_count,
-                }
+                    if reached_existing or len(raw_messages) < page_limit:
+                        break
+                    offset += page_limit
 
-            # Periodic or cold-start contacts sync
-            contact_cycles = self._contact_cycle_count.get(account.account_id, 0)
+            # Low-frequency time cadence (300s) contacts sync
             contacts_synced = 0
-            if cold_start or contact_cycles % 12 == 0:
+            now_mono = time.monotonic()
+            last_contact = self._last_contact_refresh.get(account.account_id, 0.0)
+            if cold_start or (now_mono - last_contact >= 300.0):
                 try:
                     raw_contacts = client.list_contacts(limit=500)
+                    contact_list = []
                     for rc in raw_contacts:
                         uname = str(rc.get("username") or "").strip()
                         if uname:
-                            self.store.upsert_contact(account.account_id, {
+                            contact_list.append({
                                 "member_id": uname,
                                 "remark": str(rc.get("remark") or "").strip(),
                                 "nickname": str(rc.get("nickName") or "").strip(),
@@ -676,10 +684,11 @@ class AccountWorker:
                                 "small_head_url": str(rc.get("smallHeadUrl") or "").strip(),
                                 "avatar_ref": str(rc.get("smallHeadUrl") or "").strip(),
                             })
-                            contacts_synced += 1
+                    if contact_list:
+                        contacts_synced = self.store.upsert_contacts(account.account_id, contact_list)
+                    self._last_contact_refresh[account.account_id] = now_mono
                 except Exception as exc:
                     logger.warning("AgentWechat contacts sync error for %s: %s", account.account_id, exc)
-            self._contact_cycle_count[account.account_id] = contact_cycles + 1
 
             status.update({
                 "ok": True,
@@ -753,6 +762,14 @@ class AccountSyncLoop:
         self.last_error: str = ""
         self.consecutive_failures: int = 0
 
+    def effective_interval_seconds(self) -> float:
+        registry = getattr(self.worker, "registry", None)
+        if registry:
+            accounts = registry.all()
+            if accounts and all(a.runtime_provider == "agent_wechat" for a in accounts):
+                return 1.0
+        return self.interval_seconds
+
     def is_alive(self) -> bool:
         return self._thread.is_alive()
 
@@ -782,6 +799,7 @@ class AccountSyncLoop:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            cycle_start = time.monotonic()
             self.liveness.record_cycle_start()
             self.liveness.flush()
             try:
@@ -816,4 +834,6 @@ class AccountSyncLoop:
                     "; ".join(f"{account_id}: {message}" for account_id, message in account_errors.items())
                     or "sync cycle reported failures"
                 )
-            self._stop.wait(self.interval_seconds)
+            elapsed = time.monotonic() - cycle_start
+            wait_time = max(0.0, self.effective_interval_seconds() - elapsed)
+            self._stop.wait(wait_time)

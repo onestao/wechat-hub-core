@@ -1,0 +1,10 @@
+FROM ghcr.io/onestao/wechat-hub-core@sha256:3a19c36e15d9ebf0f10d5bc5a2a7f24e90530ae084d4dc0ea286a2332fa32151
+
+ARG OCI_REVISION=""
+ARG OCI_VERSION=""
+
+LABEL org.opencontainers.image.revision="${OCI_REVISION}"
+LABEL org.opencontainers.image.version="${OCI_VERSION}"
+
+COPY core /app/core
+COPY memory /app/memory
