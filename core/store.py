@@ -718,6 +718,8 @@ class CoreStore:
             vendor = parse_json(row["vendor_json"], {})
             if not isinstance(vendor, dict):
                 continue
+            if vendor.get("source_local_id_reused"):
+                continue
             local_id = vendor.get("source_local_id")
             if local_id in (None, ""):
                 continue
@@ -1438,7 +1440,7 @@ class CoreStore:
             "vendor_specific": message.get("vendor_specific") if isinstance(message.get("vendor_specific"), dict) else {},
         }
         source_local_id = value["vendor_specific"].get("source_local_id")
-        if source_local_id not in (None, ""):
+        if source_local_id not in (None, "") and not value["vendor_specific"].get("source_local_id_reused"):
             value["source_local_id"] = str(source_local_id)
         value["source_message_table"] = str(value["vendor_specific"].get("source_message_table") or "")
         # The normalizer records the media role/status contract on the message it
@@ -1607,6 +1609,14 @@ class CoreStore:
                 (account_id,),
             ).fetchall()
         return {str(row["chat_id"]): int(row["max_id"]) for row in rows if row["max_id"] is not None}
+
+    def latest_message_created_at(self, account_id: str, chat_id: str) -> str:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT created_at FROM messages WHERE account_id=? AND chat_id=? ORDER BY julianday(created_at) DESC LIMIT 1",
+                (account_id, chat_id),
+            ).fetchone()
+        return str(row["created_at"]) if row else ""
 
     def max_source_local_id(self, account_id: str, chat_id: str) -> int:
         with self.connection() as conn:

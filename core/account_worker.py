@@ -571,7 +571,7 @@ class AccountWorker:
         status: dict[str, Any],
         started: float,
     ) -> dict[str, Any]:
-        from .agent_wechat import AgentWechatClient, AgentWechatError, normalize_agent_message, parse_timestamp_iso
+        from .agent_wechat import AgentWechatClient, AgentWechatError, content_hash, normalize_agent_message, parse_timestamp_iso
 
         state = "online"
         try:
@@ -597,10 +597,15 @@ class AccountWorker:
             chats = client.list_chats()
             chat_dicts = []
             parsed_chats = []
+            previous_chat_ids = {}
             for chat in chats:
                 chat_id = str(chat.get("id") or chat.get("username") or "").strip()
                 if not chat_id:
                     continue
+                previous_chat = self.store.chat(account.account_id, chat_id) or {}
+                previous_chat_ids[chat_id] = int(
+                    (previous_chat.get("vendor_specific") or {}).get("last_msg_local_id") or 0
+                )
                 is_group = bool(chat.get("isGroup"))
                 display_name = str(chat.get("name") or chat_id)
                 try:
@@ -625,7 +630,7 @@ class AccountWorker:
                     },
                 }
                 chat_dicts.append(chat_dict)
-                parsed_chats.append((chat_id, last_msg_local_id))
+                parsed_chats.append((chat_id, last_msg_local_id, last_activity_raw))
 
             # Batch upsert all chats in one transaction and one identity gate
             if chat_dicts:
@@ -635,9 +640,26 @@ class AccountWorker:
             # Query watermarks once per cycle for all chats of this account
             watermarks = self.store.source_local_id_watermarks(account.account_id)
 
-            for chat_id, last_msg_local_id in parsed_chats:
+            for chat_id, last_msg_local_id, last_activity_raw in parsed_chats:
                 core_max_id = watermarks.get(chat_id, 0)
-                if last_msg_local_id <= core_max_id:
+                latest_at = ""
+                latest_time = None
+                activity_time = parse_rfc3339(last_activity_raw)
+                recovered_db = last_msg_local_id <= core_max_id and core_max_id > 0
+                if recovered_db:
+                    latest_at = self.store.latest_message_created_at(account.account_id, chat_id)
+                    latest_time = parse_rfc3339(latest_at)
+                    if (
+                        latest_time
+                        and activity_time
+                        and activity_time <= latest_time
+                        and (
+                            last_msg_local_id <= previous_chat_ids.get(chat_id, 0)
+                            or last_msg_local_id == core_max_id
+                        )
+                    ):
+                        continue
+                elif last_msg_local_id == core_max_id:
                     continue
 
                 # Upstream has newer messages: paginate from offset=0
@@ -651,9 +673,22 @@ class AccountWorker:
                     reached_existing = False
                     for raw_msg in raw_messages:
                         local_id = int(raw_msg.get("localId") or 0)
-                        if local_id <= core_max_id:
+                        message_time = parse_rfc3339(parse_timestamp_iso(raw_msg.get("timestamp")))
+                        if recovered_db and latest_time and message_time and message_time < latest_time:
+                            reached_existing = True
+                            continue
+                        if not recovered_db and local_id <= core_max_id:
                             reached_existing = True
                         norm = normalize_agent_message(account.account_id, raw_msg, bound_wxid=bound_wxid)
+                        if recovered_db:
+                            source_id = str(raw_msg.get("serverId") or "").strip()
+                            identity = source_id or f"{norm['created_at']}:{local_id}"
+                            norm["message_id"] = content_hash(
+                                f"agent-wechat-recovered:{account.account_id}:{chat_id}:{identity}"
+                            )
+                            norm["vendor_specific"]["source_local_id_reused"] = True
+                            if norm.get("media_id"):
+                                norm["media_id"] = norm["message_id"]
                         res = self.store.upsert_message(norm)
                         messages_synced += 1
                         if res != "unchanged":

@@ -361,6 +361,73 @@ class AccountWorkerPaginationAndBacklogTest(unittest.TestCase):
         self.assertEqual(self.store.max_source_local_id(account.account_id, "catchup_chat"), 180)
 
     @patch("core.agent_wechat.AgentWechatClient.from_account")
+    def test_repaired_message_db_resumes_without_overwriting_old_ids(self, mock_client_factory: MagicMock) -> None:
+        from core.account_worker import AccountWorker
+
+        account = self._create_agent_account()
+        worker = AccountWorker(self.registry, self.store)
+        self.store.upsert_chat({
+            "account_id": account.account_id,
+            "chat_id": "repaired_chat",
+            "type": "private",
+            "display_name": "Repaired Chat",
+        })
+        old = normalize_agent_message(account.account_id, {
+            "localId": 2, "serverId": "old-2", "chatId": "repaired_chat",
+            "kind": "text", "content": "old", "timestamp": "2026-09-23T04:36:00Z",
+        })
+        self.store.upsert_message(old)
+        self.store.upsert_message(normalize_agent_message(account.account_id, {
+            "localId": 100, "serverId": "old-100", "chatId": "repaired_chat",
+            "kind": "text", "content": "old latest", "timestamp": "2026-09-23T04:36:13Z",
+        }))
+
+        mock_client = MagicMock(spec=AgentWechatClient)
+        mock_client.health.return_value = {"status": "ok"}
+        mock_client.list_contacts.return_value = []
+        mock_client.list_chats.return_value = [{
+            "id": "repaired_chat", "name": "Repaired Chat", "isGroup": False,
+            "lastMsgLocalId": 2, "lastActivityAt": "2026-09-24T12:05:00Z",
+            "unreadCount": 1,
+        }]
+        new = {
+            "localId": 2, "serverId": "new-2", "chatId": "repaired_chat",
+            "kind": "text", "content": "new", "timestamp": "2026-09-24T12:05:00Z",
+        }
+        mock_client.list_messages.return_value = [new]
+        mock_client_factory.return_value = mock_client
+
+        self.assertTrue(worker.run_account(account)["ok"])
+        messages = self.store.list_messages(account.account_id, "repaired_chat")["messages"]
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(next(m["text"] for m in messages if m["message_id"] == old["message_id"]), "old")
+        self.assertIn("new", [message["text"] for message in messages])
+
+        mock_client.list_messages.reset_mock()
+        self.assertTrue(worker.run_account(account)["ok"])
+        mock_client.list_messages.assert_not_called()
+
+        mock_client.list_chats.return_value[0]["lastMsgLocalId"] = 3
+        mock_client.list_chats.return_value[0]["lastActivityAt"] = "2026-09-24T12:05:00Z"
+        mock_client.list_messages.return_value = [
+            {**new, "localId": 3, "serverId": "new-3", "content": "another new"},
+            new,
+        ]
+        self.assertTrue(worker.run_account(account)["ok"])
+        messages = self.store.list_messages(account.account_id, "repaired_chat")["messages"]
+        self.assertEqual(len(messages), 4)
+        self.assertIn("another new", [message["text"] for message in messages])
+
+        self.store.close()
+        reopened = CoreStore(self.db_path)
+        try:
+            messages = reopened.list_messages(account.account_id, "repaired_chat")["messages"]
+            self.assertEqual(len(messages), 4)
+            self.assertEqual(next(m["text"] for m in messages if m["message_id"] == old["message_id"]), "old")
+        finally:
+            reopened.close()
+
+    @patch("core.agent_wechat.AgentWechatClient.from_account")
     def test_unchanged_chat_fetch_zero(self, mock_client_factory: MagicMock) -> None:
         """P0-1 Gate: UNCHANGED_CHAT_MESSAGE_FETCH = 0 when lastMsgLocalId <= core_max_id."""
         from core.account_worker import AccountWorker
