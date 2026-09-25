@@ -366,11 +366,44 @@ class SourceProvenanceReleaseLineageTests(unittest.TestCase):
             acc.keys_file.write_text("{}", encoding="utf-8")
             return {"returncode": 0}
 
+        mock_client = MagicMock()
+        mock_client.health.return_value = {"status": "ok"}
+        mock_client.list_chats.return_value = [
+            {
+                "id": "peer_chat",
+                "name": "Peer Chat",
+                "isGroup": False,
+                "lastMsgLocalId": 1,
+                "lastActivityAt": "2026-03-30T10:00:00Z",
+                "unreadCount": 1,
+            }
+        ]
+        mock_client.list_messages.return_value = [
+            {
+                "localId": 1,
+                "serverId": "srv_1",
+                "chatId": "peer_chat",
+                "kind": "text",
+                "content": "hello from peer",
+                "timestamp": "2026-03-30T10:00:01Z",
+                "isSelf": False,
+            }
+        ]
+        mock_client.list_contacts.return_value = [
+            {
+                "username": "peer_contact",
+                "remark": "",
+                "nickName": "Peer Contact",
+                "alias": "",
+                "smallHeadUrl": "",
+            }
+        ]
+
         with patch("memory.decrypt_sync.refresh_decrypted", return_value={"updated": [], "skipped": [], "missing_key": [], "failed": []}), patch(
             "memory.media_sync.sync_media", return_value={}
         ), patch("memory.memory_ingest.ingest_memory", return_value={}), patch(
             "core.key_extract.extract_account_keys", side_effect=_mock_key_extract
-        ):
+        ), patch("core.agent_wechat.AgentWechatClient.from_account", return_value=mock_client):
             result = worker.run_once()
 
         accounts_result = {res["account_id"]: res for res in result["accounts"]}

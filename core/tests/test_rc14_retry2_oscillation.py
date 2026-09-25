@@ -135,6 +135,8 @@ class TestRC14Retry2Oscillation(unittest.TestCase):
             patch("memory.sync_repair.repair_memory_indexes", return_value={"ok": True}),
             patch("core.account_worker.import_account", return_value={"chats": 0, "messages": 0, "message_changes": 0}),
             patch("core.key_extract.extract_account_keys", return_value={"returncode": 0}),
+            # The current AgentWechat path builds a client before sync work.
+            patch("core.agent_wechat.AgentWechatClient.from_account", return_value=MagicMock()),
         )
 
     # --------------------------------------------------------------------------
@@ -159,7 +161,7 @@ class TestRC14Retry2Oscillation(unittest.TestCase):
 
         # Run worker cycle
         patches = self._mock_worker_sync_patches()
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
             self.worker.run_account(self.account_config)
 
         acct_after_worker = self.store.account("testb")
@@ -181,7 +183,7 @@ class TestRC14Retry2Oscillation(unittest.TestCase):
         # Seed initial state
         self.service._apply_runtime_status(status)
         patches = self._mock_worker_sync_patches()
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
             self.worker.run_account(self.account_config)
 
         # Record baseline event count (typically 1 for initial creation)
@@ -189,7 +191,7 @@ class TestRC14Retry2Oscillation(unittest.TestCase):
         self.assertGreaterEqual(baseline_events, 1)
 
         # 1,000 alternating cycles
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
             for _ in range(1000):
                 self.service._apply_runtime_status(status)
                 self.worker.run_account(self.account_config)
@@ -211,12 +213,12 @@ class TestRC14Retry2Oscillation(unittest.TestCase):
         status = self._write_status()
         self.service._apply_runtime_status(status)
         patches = self._mock_worker_sync_patches()
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
             self.worker.run_account(self.account_config)
 
         baseline_events = self._count_status_events()
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
             for i in range(1000):
                 # Telemetry changes: pids, windows, window_error fluctuation
                 status = self._write_status(
@@ -244,7 +246,7 @@ class TestRC14Retry2Oscillation(unittest.TestCase):
         status = self._write_status()
         self.service._apply_runtime_status(status)
         patches = self._mock_worker_sync_patches()
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
             self.worker.run_account(self.account_config)
 
         events_before = self._count_status_events()
@@ -358,7 +360,7 @@ class TestRC14Retry2Oscillation(unittest.TestCase):
         # Status file has transient empty logged_in_user
         self._write_status(logged_in_user="")
         patches = self._mock_worker_sync_patches()
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
             sync_result = self.worker.run_account(self.account_config)
 
         # Must succeed and stay on current db
