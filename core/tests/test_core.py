@@ -553,6 +553,81 @@ class CoreHttpTest(unittest.TestCase):
         self.assertEqual([row["echo_message_id"] for row in rows], ["", ""])
         self.assertEqual([row["status"] for row in rows], ["submitted", "submitted"])
 
+    def _submitted_send(self, kind, payload, key):
+        receipt = self.store.queue_send(kind, {"account_id": "alpha", "chat_id": "same-chat", **payload}, idempotency_key=key)
+        return self.store.transition_send(
+            receipt["send_id"],
+            "submitted",
+            details={"delivery_certainty": "pending_confirmation", "automatic_retry": False},
+        )
+
+    def _outgoing(self, message_id, message_type, **extra):
+        return self.store.upsert_message(
+            {
+                "account_id": "alpha",
+                "message_id": message_id,
+                "chat_id": "same-chat",
+                "type": message_type,
+                "direction": "outgoing",
+                "created_at": utc_now(),
+                "author": {"member_id": "self", "display_name": "Self", "is_self": True},
+                **extra,
+            }
+        )
+
+    def _outbox(self, send_id):
+        with self.store.connection() as conn:
+            return conn.execute("SELECT status, echo_message_id, details_json FROM outbox WHERE send_id=?", (send_id,)).fetchone()
+
+    def test_unique_image_echo_is_reconciled_before_message_event(self):
+        receipt = self._submitted_send("image", {"filename": "photo.jpg"}, "echo-image")
+        before = self.store.poll_events(after="0", limit=200)["next_cursor"]
+        self._outgoing("wechat-image-1", "image", media_id="m1")
+        page = self.store.poll_events(after=before, limit=20)
+        self.assertEqual([event["event_type"] for event in page["events"]], ["send.updated", "message.created"])
+        row = self._outbox(receipt["send_id"])
+        self.assertEqual((row["status"], row["echo_message_id"]), ("sent", "wechat-image-1"))
+        self.assertIn("unique_recent_image", row["details_json"])
+
+    def test_file_echo_requires_matching_filename(self):
+        receipt = self._submitted_send("file", {"filename": "report.pdf"}, "echo-file")
+        self._outgoing("wechat-file-other", "file", filename="other.pdf")
+        self.assertEqual(self._outbox(receipt["send_id"])["status"], "submitted")
+        self._outgoing("wechat-file-1", "file", filename="report.pdf")
+        row = self._outbox(receipt["send_id"])
+        self.assertEqual((row["status"], row["echo_message_id"]), ("sent", "wechat-file-1"))
+
+    def test_image_echo_does_not_match_text_send(self):
+        receipt = self._submitted_send("text", {"text": "hello"}, "echo-text-vs-image")
+        self._outgoing("wechat-image-2", "image", media_id="m2")
+        self.assertEqual(self._outbox(receipt["send_id"])["status"], "submitted")
+
+    def test_ambiguous_image_echo_is_not_guessed(self):
+        receipts = [self._submitted_send("image", {"filename": f"{key}.jpg"}, key) for key in ("img-a", "img-b")]
+        self._outgoing("wechat-image-3", "image", media_id="m3")
+        self.assertEqual([self._outbox(r["send_id"])["status"] for r in receipts], ["submitted", "submitted"])
+
+    def test_echo_stored_before_submission_is_linked_on_submit(self):
+        receipt = self.store.queue_send(
+            "image", {"account_id": "alpha", "chat_id": "same-chat", "filename": "early.jpg"}, idempotency_key="echo-early"
+        )
+        self._outgoing("wechat-image-early", "image", media_id="m4")
+        submitted = self.store.transition_send(
+            receipt["send_id"],
+            "submitted",
+            details={"delivery_certainty": "pending_confirmation", "automatic_retry": False},
+        )
+        self.assertEqual(submitted["status"], "sent")
+        self.assertEqual(submitted.get("echo_message_id"), "wechat-image-early")
+
+    def test_echo_linked_once_is_not_reused(self):
+        first = self._submitted_send("image", {"filename": "one.jpg"}, "echo-once-1")
+        self._outgoing("wechat-image-once", "image", media_id="m5")
+        self.assertEqual(self._outbox(first["send_id"])["status"], "sent")
+        second = self._submitted_send("image", {"filename": "two.jpg"}, "echo-once-2")
+        self.assertEqual(second["status"], "submitted")
+        self.assertEqual(self._outbox(second["send_id"])["echo_message_id"], "")
+
     def test_idempotency_key_reuse_with_different_account_or_request_conflicts(self):
         first_payload = {"account_id": "alpha", "chat_id": "same-chat", "text": "hello"}
         _, first = self.request(

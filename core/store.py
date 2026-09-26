@@ -1332,59 +1332,63 @@ class CoreStore:
                 output["media_status"] = media["status"]
         return output
 
-    def _reconcile_text_echo(self, conn: sqlite3.Connection, message: dict[str, Any]) -> str:
-        """Conservatively link one outgoing text to one submitted outbox row.
+    # Outbox kind -> outgoing message types that can be its WeChat echo.
+    _ECHO_TYPES_BY_KIND: dict[str, tuple[str, ...]] = {
+        "text": ("text",),
+        "image": ("image",),
+        "file": ("file", "video"),
+    }
+    _ECHO_WINDOW_BEFORE_SECONDS = 10
+    _ECHO_WINDOW_AFTER_SECONDS = 180
 
-        The X11 controller cannot return a WeChat message ID.  We therefore
-        only reconcile when there is exactly one recent, already-submitted,
-        plain-text candidate with an exact text match.  Mention sends are
-        skipped because the GUI may materialize the blue mention differently
-        from the request text.  Ambiguity intentionally leaves the send
-        unconfirmed rather than risking a false echo mapping.
+    @classmethod
+    def _echo_kind_for_type(cls, message_type: str) -> str:
+        for kind, types in cls._ECHO_TYPES_BY_KIND.items():
+            if message_type in types:
+                return kind
+        return ""
+
+    @staticmethod
+    def _echo_request_matches(kind: str, request: dict[str, Any], message: dict[str, Any]) -> bool:
+        """Content check between a send request and an outgoing message.
+
+        Text needs an exact match (mention sends are skipped because the GUI
+        may render the mention differently).  Files must keep their filename
+        when both sides know it.  Images carry no comparable content, so they
+        rely on the uniqueness rule alone.
         """
-        if message.get("direction") != "outgoing" or message.get("type") != "text":
-            return ""
-        text = str(message.get("text") or "").strip()
-        message_id = str(message.get("message_id") or "").strip()
-        message_time = parse_rfc3339(str(message.get("created_at") or ""))
-        if not text or not message_id or message_time is None:
-            return ""
-
-        rows = conn.execute(
-            """
-            SELECT * FROM outbox
-            WHERE account_id=? AND chat_id=? AND kind='text'
-              AND status='submitted' AND echo_message_id=''
-            ORDER BY updated_at DESC
-            LIMIT 20
-            """,
-            (str(message["account_id"]), str(message["chat_id"])),
-        ).fetchall()
-        candidates: list[sqlite3.Row] = []
-        for row in rows:
-            request = parse_json(row["request_json"], {})
-            if not isinstance(request, dict):
-                continue
+        if kind == "text":
             if request.get("mention_member_ids"):
-                continue
-            if str(request.get("text") or "").strip() != text:
-                continue
-            sent_time = parse_rfc3339(str(row["updated_at"] or row["accepted_at"] or ""))
-            if sent_time is None:
-                continue
-            delta = (message_time - sent_time).total_seconds()
-            if -10 <= delta <= 180:
-                candidates.append(row)
-        if len(candidates) != 1:
-            return ""
+                return False
+            text = str(message.get("text") or "").strip()
+            return bool(text) and str(request.get("text") or "").strip() == text
+        if kind == "file":
+            wanted = str(request.get("filename") or "").strip().lower()
+            seen = str(message.get("filename") or "").strip().lower()
+            return not wanted or not seen or wanted == seen
+        return kind == "image"
 
-        row = candidates[0]
+    def _echo_in_window(self, sent_at: str, message_created_at: str) -> bool:
+        sent_time = parse_rfc3339(sent_at)
+        message_time = parse_rfc3339(message_created_at)
+        if sent_time is None or message_time is None:
+            return False
+        delta = (message_time - sent_time).total_seconds()
+        return -self._ECHO_WINDOW_BEFORE_SECONDS <= delta <= self._ECHO_WINDOW_AFTER_SECONDS
+
+    def _link_echo(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        message_id: str,
+        method: str,
+    ) -> bool:
         now = utc_now()
         details = parse_json(row["details_json"], {})
         if not isinstance(details, dict):
             details = {}
         details["echo_reconciliation"] = {
-            "method": "unique_exact_text",
+            "method": method,
             "message_id": message_id,
             "matched_at": now,
         }
@@ -1399,16 +1403,118 @@ class CoreStore:
             (message_id, compact_json(details), now, row["send_id"]),
         ).rowcount
         if changed != 1:
-            return ""
+            return False
         updated = conn.execute("SELECT * FROM outbox WHERE send_id=?", (row["send_id"],)).fetchone()
-        receipt = self._receipt(updated)
         self._append_event(
             conn,
-            str(message["account_id"]),
+            str(row["account_id"]),
             "send.updated",
-            {"send": receipt, "details": {"echo_reconciliation": details["echo_reconciliation"]}},
+            {"send": self._receipt(updated), "details": {"echo_reconciliation": details["echo_reconciliation"]}},
         )
-        return str(row["send_id"])
+        return True
+
+    def _reconcile_text_echo(self, conn: sqlite3.Connection, message: dict[str, Any]) -> str:
+        """Conservatively link one outgoing message to one submitted outbox row.
+
+        The X11 controller cannot return a WeChat message ID.  We therefore
+        only reconcile when there is exactly one recent, already-submitted
+        candidate of the same kind in the chat whose content matches (exact
+        text for text, filename for files; images have no comparable
+        content).  Ambiguity intentionally leaves the send unconfirmed rather
+        than risking a false echo mapping.
+        """
+        if message.get("direction") != "outgoing":
+            return ""
+        kind = self._echo_kind_for_type(str(message.get("type") or ""))
+        message_id = str(message.get("message_id") or "").strip()
+        if not kind or not message_id or parse_rfc3339(str(message.get("created_at") or "")) is None:
+            return ""
+        already = conn.execute(
+            "SELECT 1 FROM outbox WHERE account_id=? AND echo_message_id=? LIMIT 1",
+            (str(message["account_id"]), message_id),
+        ).fetchone()
+        if already:
+            return ""
+
+        rows = conn.execute(
+            """
+            SELECT * FROM outbox
+            WHERE account_id=? AND chat_id=? AND kind=?
+              AND status='submitted' AND echo_message_id=''
+            ORDER BY updated_at DESC
+            LIMIT 20
+            """,
+            (str(message["account_id"]), str(message["chat_id"]), kind),
+        ).fetchall()
+        candidates: list[sqlite3.Row] = []
+        for row in rows:
+            request = parse_json(row["request_json"], {})
+            if not isinstance(request, dict) or not self._echo_request_matches(kind, request, message):
+                continue
+            if self._echo_in_window(str(row["updated_at"] or row["accepted_at"] or ""), str(message["created_at"])):
+                candidates.append(row)
+        if len(candidates) != 1:
+            return ""
+        method = "unique_exact_text" if kind == "text" else f"unique_recent_{kind}"
+        if not self._link_echo(conn, candidates[0], message_id, method):
+            return ""
+        return str(candidates[0]["send_id"])
+
+    def _reconcile_submitted_send(self, conn: sqlite3.Connection, send_id: str) -> str:
+        """Look back for an echo that was stored before the send was submitted.
+
+        WeChat can write the outgoing row while the UI plan is still finishing
+        (typically for images and files), so the echo may already be in
+        ``messages`` when the sender reports ``submitted``.  The same
+        uniqueness rules apply: exactly one matching, not yet linked outgoing
+        message of the same kind in the chat inside the window.
+        """
+        row = conn.execute("SELECT * FROM outbox WHERE send_id=?", (send_id,)).fetchone()
+        if row is None or str(row["status"]) != "submitted" or str(row["echo_message_id"] or ""):
+            return ""
+        kind = str(row["kind"])
+        types = self._ECHO_TYPES_BY_KIND.get(kind)
+        if not types:
+            return ""
+        request = parse_json(row["request_json"], {})
+        if not isinstance(request, dict):
+            return ""
+        placeholders = ",".join("?" for _ in types)
+        messages = conn.execute(
+            f"""
+            SELECT m.message_id, m.type, m.text, m.filename, m.created_at FROM messages m
+            WHERE m.account_id=? AND m.chat_id=? AND m.direction='outgoing' AND m.type IN ({placeholders})
+              AND NOT EXISTS (
+                SELECT 1 FROM outbox o WHERE o.account_id=m.account_id AND o.echo_message_id=m.message_id
+              )
+            ORDER BY m.created_at DESC
+            LIMIT 20
+            """,
+            (str(row["account_id"]), str(row["chat_id"]), *types),
+        ).fetchall()
+        sent_at = str(row["accepted_at"] or row["updated_at"] or "")
+        matches = [
+            m for m in messages
+            if self._echo_in_window(sent_at, str(m["created_at"]))
+            and self._echo_request_matches(kind, request, dict(m))
+        ]
+        if len(matches) != 1:
+            return ""
+        # The message must not also fit another submitted send of this kind.
+        others = conn.execute(
+            """
+            SELECT COUNT(*) FROM outbox
+            WHERE account_id=? AND chat_id=? AND kind=? AND status='submitted'
+              AND echo_message_id='' AND send_id<>?
+            """,
+            (str(row["account_id"]), str(row["chat_id"]), kind, send_id),
+        ).fetchone()[0]
+        if others:
+            return ""
+        method = "unique_exact_text" if kind == "text" else f"unique_recent_{kind}"
+        if not self._link_echo(conn, row, str(matches[0]["message_id"]), method):
+            return ""
+        return str(matches[0]["message_id"])
 
     def upsert_message(self, message: dict[str, Any]) -> str:
         required = ("account_id", "message_id", "chat_id", "type", "direction", "created_at", "author")
@@ -2933,6 +3039,9 @@ class CoreStore:
             if error:
                 payload["error"] = {"code": error_code or "sender_failed", "message": error}
             self._append_event(conn, updated["account_id"], "send.updated", payload)
+            if status == "submitted" and not echo_message_id:
+                if self._reconcile_submitted_send(conn, send_id):
+                    receipt = self._receipt(conn.execute("SELECT * FROM outbox WHERE send_id=?", (send_id,)).fetchone())
         return receipt
 
     def close(self) -> None:
