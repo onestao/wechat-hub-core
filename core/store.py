@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -95,8 +96,26 @@ def find_governance_config_path() -> Path | None:
     return None
 
 
+EXTRA_CONSUMERS_ENV = "WECHAT_CORE_EXTRA_CONSUMERS"
+_EXTRA_CONSUMER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:#-]{0,127}$")
+
+
+def get_extra_consumers() -> set[str]:
+    """Operator-registered consumers, e.g. a second EFB instance.
+
+    ``WECHAT_CORE_EXTRA_CONSUMERS`` holds consumer ids separated by commas or
+    whitespace. Invalid ids are ignored.
+    """
+    raw = os.environ.get(EXTRA_CONSUMERS_ENV, "")
+    return {
+        cid
+        for cid in (part.strip() for part in re.split(r"[\s,]+", raw))
+        if cid and _EXTRA_CONSUMER_ID_RE.match(cid)
+    }
+
+
 def get_registered_consumers() -> set[str]:
-    registered = set(REGISTERED_CONSUMERS)
+    registered = set(REGISTERED_CONSUMERS) | get_extra_consumers()
     config_path = find_governance_config_path()
     if config_path and config_path.is_file():
         try:
