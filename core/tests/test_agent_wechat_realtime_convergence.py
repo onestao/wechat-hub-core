@@ -428,6 +428,117 @@ class AccountWorkerPaginationAndBacklogTest(unittest.TestCase):
             reopened.close()
 
     @patch("core.agent_wechat.AgentWechatClient.from_account")
+    def test_latest_message_is_not_duplicated_when_chat_activity_changes(self, mock_client_factory: MagicMock) -> None:
+        """A chat whose newest local id is already stored but whose activity time
+        moved (e.g. the latest row was rewritten) takes the recovered-db path.
+        Re-reading that latest message must update the stored row (same server
+        id) instead of storing it a second time under a new message id."""
+        from core.account_worker import AccountWorker
+
+        account = self._create_agent_account()
+        worker = AccountWorker(self.registry, self.store)
+        self.store.upsert_chat({
+            "account_id": account.account_id,
+            "chat_id": "busy_chat",
+            "type": "group",
+            "display_name": "Busy",
+        })
+        latest = {
+            "localId": 99, "serverId": "7766554433", "chatId": "busy_chat",
+            "kind": "reply", "content": "1", "timestamp": "2026-09-27T12:07:53Z",
+        }
+        stored = normalize_agent_message(account.account_id, latest)
+        self.store.upsert_message(stored)
+
+        mock_client = MagicMock(spec=AgentWechatClient)
+        mock_client.health.return_value = {"status": "ok"}
+        mock_client.list_contacts.return_value = []
+        mock_client.list_chats.return_value = [{
+            "id": "busy_chat", "name": "Busy", "isGroup": True,
+            "lastMsgLocalId": 99, "lastActivityAt": "2026-09-27T12:08:30Z",
+            "unreadCount": 0,
+        }]
+        mock_client.list_messages.return_value = [latest]
+        mock_client_factory.return_value = mock_client
+
+        self.assertTrue(worker.run_account(account)["ok"])
+        messages = self.store.list_messages(account.account_id, "busy_chat")["messages"]
+        self.assertEqual([m["message_id"] for m in messages], [stored["message_id"]])
+
+        # A genuinely new message (new server id) is still stored.
+        mock_client.list_chats.return_value[0]["lastActivityAt"] = "2026-09-27T12:09:00Z"
+        mock_client.list_messages.return_value = [
+            {**latest, "serverId": "7766554434", "content": "2", "timestamp": "2026-09-27T12:09:00Z"},
+            latest,
+        ]
+        self.assertTrue(worker.run_account(account)["ok"])
+        messages = self.store.list_messages(account.account_id, "busy_chat")["messages"]
+        self.assertEqual(sorted(m["text"] for m in messages), ["1", "2"])
+
+    @patch("core.agent_wechat.AgentWechatClient.from_account")
+    def test_quote_reply_links_to_quoted_message(self, mock_client_factory: MagicMock) -> None:
+        """A quote reply carries the quoted message's server id; Core links it
+        to the stored message as target_message_id, whether that message was
+        stored earlier or arrives in the same page."""
+        from core.account_worker import AccountWorker
+
+        account = self._create_agent_account()
+        worker = AccountWorker(self.registry, self.store)
+        self.store.upsert_chat({
+            "account_id": account.account_id,
+            "chat_id": "quote_chat",
+            "type": "group",
+            "display_name": "Quotes",
+        })
+        earlier = {
+            "localId": 10, "serverId": "7412963524102716521", "chatId": "quote_chat",
+            "kind": "image", "type": 3, "content": "", "timestamp": "2026-09-27T12:00:00Z",
+        }
+        stored = normalize_agent_message(account.account_id, earlier)
+        self.store.upsert_message(stored)
+
+        same_page_quoted = {
+            "localId": 11, "serverId": "7412963524102716600", "chatId": "quote_chat",
+            "kind": "text", "type": 1, "content": "hello", "timestamp": "2026-09-27T12:01:00Z",
+        }
+        reply_old = {
+            "localId": 12, "serverId": "7412963524102716700", "chatId": "quote_chat",
+            "kind": "reply", "type": 49, "content": "1", "timestamp": "2026-09-27T12:02:00Z",
+            "reply": {"sender": "A", "content": "[image]", "serverId": "7412963524102716521", "senderId": "wxid_a"},
+        }
+        reply_same_page = {
+            "localId": 13, "serverId": "7412963524102716800", "chatId": "quote_chat",
+            "kind": "reply", "type": 49, "content": "2", "timestamp": "2026-09-27T12:03:00Z",
+            "reply": {"sender": "B", "content": "hello", "serverId": "7412963524102716600"},
+        }
+        reply_unknown = {
+            "localId": 14, "serverId": "7412963524102716900", "chatId": "quote_chat",
+            "kind": "reply", "type": 49, "content": "3", "timestamp": "2026-09-27T12:04:00Z",
+            "reply": {"sender": "C", "content": "old", "serverId": "1111111111111111111"},
+        }
+
+        mock_client = MagicMock(spec=AgentWechatClient)
+        mock_client.health.return_value = {"status": "ok"}
+        mock_client.list_contacts.return_value = []
+        mock_client.list_chats.return_value = [{
+            "id": "quote_chat", "name": "Quotes", "isGroup": True,
+            "lastMsgLocalId": 14, "lastActivityAt": "2026-09-27T12:04:00Z",
+            "unreadCount": 0,
+        }]
+        mock_client.list_messages.return_value = [reply_unknown, reply_same_page, reply_old, same_page_quoted]
+        mock_client_factory.return_value = mock_client
+
+        self.assertTrue(worker.run_account(account)["ok"])
+        messages = {
+            m.get("text", ""): m for m in self.store.list_messages(account.account_id, "quote_chat")["messages"]
+        }
+        quoted_same_page = normalize_agent_message(account.account_id, same_page_quoted)["message_id"]
+        self.assertEqual(messages["1"].get("target_message_id"), stored["message_id"])
+        self.assertEqual(messages["2"].get("target_message_id"), quoted_same_page)
+        self.assertFalse(messages["3"].get("target_message_id"))
+        self.assertEqual(messages["1"]["attributes"]["reply"]["server_id"], "7412963524102716521")
+
+    @patch("core.agent_wechat.AgentWechatClient.from_account")
     def test_unchanged_chat_fetch_zero(self, mock_client_factory: MagicMock) -> None:
         """P0-1 Gate: UNCHANGED_CHAT_MESSAGE_FETCH = 0 when lastMsgLocalId <= core_max_id."""
         from core.account_worker import AccountWorker

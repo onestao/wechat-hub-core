@@ -180,6 +180,29 @@ class AccountWorker:
         self._account_initialized: set[str] = set()
         self._last_contact_refresh: dict[str, float] = {}
 
+    def _link_reply_target(
+        self,
+        account_id: str,
+        chat_id: str,
+        norm: dict[str, Any],
+        page_ids: dict[str, str],
+    ) -> None:
+        """Set target_message_id on a quote reply whose quoted message is known."""
+        if str(norm.get("target_message_id") or ""):
+            return
+        reply = (norm.get("attributes") or {}).get("reply")
+        if not isinstance(reply, dict):
+            return
+        quoted = str(reply.get("server_id") or "").strip()
+        if not quoted:
+            return
+        target = page_ids.get(quoted)
+        if not target:
+            existing = self.store.message_for_server_id(account_id, chat_id, quoted)
+            target = existing["message_id"] if existing else ""
+        if target and target != norm.get("message_id"):
+            norm["target_message_id"] = target
+
     def _assert_source_provenance(self, account: AccountConfig) -> None:
         """Fail closed when the selected source directory belongs to another wxid.
 
@@ -671,6 +694,7 @@ class AccountWorker:
                         break
 
                     reached_existing = False
+                    page_norms: list[tuple[dict[str, Any], int]] = []
                     for raw_msg in raw_messages:
                         local_id = int(raw_msg.get("localId") or 0)
                         message_time = parse_rfc3339(parse_timestamp_iso(raw_msg.get("timestamp")))
@@ -680,8 +704,26 @@ class AccountWorker:
                         if not recovered_db and local_id <= core_max_id:
                             reached_existing = True
                         norm = normalize_agent_message(account.account_id, raw_msg, bound_wxid=bound_wxid)
-                        if recovered_db:
-                            source_id = str(raw_msg.get("serverId") or "").strip()
+                        source_id = str(raw_msg.get("serverId") or "").strip()
+                        # The same WeChat message may already be stored under the
+                        # other identity scheme (canonical local-id hash vs. the
+                        # recovered-db hash below). A server id identifies it, so
+                        # update that row instead of creating a duplicate.
+                        existing = self.store.message_for_server_id(
+                            account.account_id, chat_id, source_id
+                        )
+                        if existing:
+                            norm["message_id"] = existing["message_id"]
+                            if norm.get("media_id"):
+                                norm["media_id"] = existing["message_id"]
+                            # Keep the stored row's local-id identity: a recovered
+                            # (reused) row stays without a local id, and a
+                            # canonical row keeps the local id it was stored with.
+                            if existing["source_local_id_reused"]:
+                                norm["vendor_specific"]["source_local_id_reused"] = True
+                            elif str(existing["source_local_id"]).isdigit():
+                                norm["vendor_specific"]["source_local_id"] = int(existing["source_local_id"])
+                        elif recovered_db:
                             identity = source_id or f"{norm['created_at']}:{local_id}"
                             norm["message_id"] = content_hash(
                                 f"agent-wechat-recovered:{account.account_id}:{chat_id}:{identity}"
@@ -689,6 +731,18 @@ class AccountWorker:
                             norm["vendor_specific"]["source_local_id_reused"] = True
                             if norm.get("media_id"):
                                 norm["media_id"] = norm["message_id"]
+                        page_norms.append((norm, local_id))
+
+                    # A quote reply names the quoted message by server id. Link
+                    # it to the stored message (or one from this same page) so
+                    # consumers can render a native reply.
+                    page_ids = {
+                        str(n.get("vendor_specific", {}).get("source_server_id") or ""): n["message_id"]
+                        for n, _ in page_norms
+                    }
+                    page_ids.pop("", None)
+                    for norm, local_id in page_norms:
+                        self._link_reply_target(account.account_id, chat_id, norm, page_ids)
                         res = self.store.upsert_message(norm)
                         messages_synced += 1
                         if res != "unchanged":

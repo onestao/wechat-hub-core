@@ -208,6 +208,14 @@ def normalize_agent_message(
             "sender": reply.get("sender") or "",
             "content": reply.get("content") or "",
         }
+        # Server id of the quoted message (refermsg svrid). The worker uses it
+        # to link the reply to the stored message (target_message_id).
+        quoted_server_id = str(reply.get("serverId") or "").strip()
+        if quoted_server_id.isdigit() and quoted_server_id != "0":
+            attributes["reply"]["server_id"] = quoted_server_id
+        quoted_sender_id = str(reply.get("senderId") or "").strip()
+        if quoted_sender_id:
+            attributes["reply"]["sender_id"] = quoted_sender_id
     if kind == "link":
         attributes["semantic_type"] = "link"
     elif kind == "file":
