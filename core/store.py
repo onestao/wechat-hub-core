@@ -1610,6 +1610,31 @@ class CoreStore:
             ).fetchall()
         return {str(row["chat_id"]): int(row["max_id"]) for row in rows if row["max_id"] is not None}
 
+    def message_for_server_id(self, account_id: str, chat_id: str, server_id: str) -> dict[str, Any] | None:
+        """Stored row (message_id, source_local_id, reused flag) for a WeChat server id."""
+        sid = str(server_id or "").strip()
+        if not sid or sid == "0":
+            return None
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT message_id, source_local_id, vendor_json FROM messages
+                WHERE account_id=? AND chat_id=?
+                  AND CAST(json_extract(vendor_json, '$.source_server_id') AS TEXT)=?
+                ORDER BY rowid
+                LIMIT 1
+                """,
+                (account_id, chat_id, sid),
+            ).fetchone()
+        if row is None:
+            return None
+        vendor = parse_json(row["vendor_json"], {})
+        return {
+            "message_id": str(row["message_id"]),
+            "source_local_id": str(row["source_local_id"] or ""),
+            "source_local_id_reused": bool(isinstance(vendor, dict) and vendor.get("source_local_id_reused")),
+        }
+
     def latest_message_created_at(self, account_id: str, chat_id: str) -> str:
         with self.connection() as conn:
             row = conn.execute(

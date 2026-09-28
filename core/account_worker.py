@@ -680,8 +680,26 @@ class AccountWorker:
                         if not recovered_db and local_id <= core_max_id:
                             reached_existing = True
                         norm = normalize_agent_message(account.account_id, raw_msg, bound_wxid=bound_wxid)
-                        if recovered_db:
-                            source_id = str(raw_msg.get("serverId") or "").strip()
+                        source_id = str(raw_msg.get("serverId") or "").strip()
+                        # The same WeChat message may already be stored under the
+                        # other identity scheme (canonical local-id hash vs. the
+                        # recovered-db hash below). A server id identifies it, so
+                        # update that row instead of creating a duplicate.
+                        existing = self.store.message_for_server_id(
+                            account.account_id, chat_id, source_id
+                        )
+                        if existing:
+                            norm["message_id"] = existing["message_id"]
+                            if norm.get("media_id"):
+                                norm["media_id"] = existing["message_id"]
+                            # Keep the stored row's local-id identity: a recovered
+                            # (reused) row stays without a local id, and a
+                            # canonical row keeps the local id it was stored with.
+                            if existing["source_local_id_reused"]:
+                                norm["vendor_specific"]["source_local_id_reused"] = True
+                            elif str(existing["source_local_id"]).isdigit():
+                                norm["vendor_specific"]["source_local_id"] = int(existing["source_local_id"])
+                        elif recovered_db:
                             identity = source_id or f"{norm['created_at']}:{local_id}"
                             norm["message_id"] = content_hash(
                                 f"agent-wechat-recovered:{account.account_id}:{chat_id}:{identity}"
