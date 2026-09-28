@@ -428,6 +428,29 @@ class AccountWorkerPaginationAndBacklogTest(unittest.TestCase):
             reopened.close()
 
     @patch("core.agent_wechat.AgentWechatClient.from_account")
+    def test_idle_chat_keeps_its_time_across_syncs(self, mock_client_factory: MagicMock) -> None:
+        """A chat with no activity in WeChat's session list must not be stamped
+        with the current time on every sync (it would sort above active chats)."""
+        from core.account_worker import AccountWorker
+
+        account = self._create_agent_account()
+        worker = AccountWorker(self.registry, self.store)
+        mock_client = MagicMock(spec=AgentWechatClient)
+        mock_client.health.return_value = {"status": "ok"}
+        mock_client.list_contacts.return_value = []
+        mock_client.list_messages.return_value = []
+        mock_client.list_chats.return_value = [
+            {"id": "idle@chatroom", "name": "Idle", "isGroup": True, "lastMsgLocalId": 0, "unreadCount": 0},
+        ]
+        mock_client_factory.return_value = mock_client
+
+        self.assertTrue(worker.run_account(account)["ok"])
+        first = self.store.chat(account.account_id, "idle@chatroom")["updated_at"]
+        with patch("core.account_worker.now_iso", return_value="2099-01-01T00:00:00Z"):
+            self.assertTrue(worker.run_account(account)["ok"])
+        self.assertEqual(first, self.store.chat(account.account_id, "idle@chatroom")["updated_at"])
+
+    @patch("core.agent_wechat.AgentWechatClient.from_account")
     def test_unchanged_chat_fetch_zero(self, mock_client_factory: MagicMock) -> None:
         """P0-1 Gate: UNCHANGED_CHAT_MESSAGE_FETCH = 0 when lastMsgLocalId <= core_max_id."""
         from core.account_worker import AccountWorker

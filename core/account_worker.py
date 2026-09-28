@@ -623,7 +623,10 @@ class AccountWorker:
                     "chat_id": chat_id,
                     "type": "group" if is_group else "private",
                     "display_name": display_name,
-                    "updated_at": last_activity_raw if last_activity_raw else now_iso(),
+                    # A chat without any activity (no messages in WeChat's
+                    # session list) keeps its stored time; stamping "now" on
+                    # every sync sorted idle chats above active ones.
+                    "updated_at": last_activity_raw or str(previous_chat.get("updated_at") or "") or now_iso(),
                     "vendor_specific": {
                         "provider": "agent_wechat",
                         "last_msg_local_id": last_msg_local_id,
